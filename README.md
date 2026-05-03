@@ -289,12 +289,8 @@ python run.py
 - [FastAPI](https://fastapi.tiangolo.com/) - 现代 Web 框架
 - [ArXiv API](https://arxiv.org/help/api) - 学术论文数据源
 - [Qdrant](https://qdrant.tech/) - 向量数据库
+- [InnoCore AI](https://github.com/A-pricity/innocore-ai) - A-pricity开发
 
-## 📮 联系方式
-
-- 项目主页：[GitHub](https://github.com/A-pricity/innocore-ai)
-- 问题反馈：[Issues](https://github.com/A-pricity/innocore-ai/issues)
-- 邮箱：2827867731@qq.com
 
 ---
 
