@@ -51,11 +51,11 @@ class VectorDBConfig:
 @dataclass
 class DatabaseConfig:
     """关系数据库配置"""
-    host: str = "localhost"
-    port: int = 5432
-    database: str = "innocore_ai"
-    username: str = os.getenv("POSTGRES_USER","postgres")
-    password: str = os.getenv("POSTGRES_PASSWORD","password")
+    host: str = os.getenv("POSTGRES_HOST", "localhost")
+    port: int = int(os.getenv("POSTGRES_PORT", "5432"))
+    database: str = os.getenv("POSTGRES_DB", "innocore_ai")
+    username: str = os.getenv("POSTGRES_USER", "postgres")
+    password: str = os.getenv("POSTGRES_PASSWORD", "password")
     pool_size: int = 10
 
 @dataclass
