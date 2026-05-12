@@ -5,16 +5,36 @@ InnoCore AI 写作助教 (Coach Agent) - 基于 LangChain 框架
 
 import asyncio
 import json
-from typing import Dict, List, Optional, Any
+import logging
+from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
+from dataclasses import dataclass, field
 
 from agents.base import BaseAgent
 from core.database import db_manager
 from core.vector_store import vector_store_manager
-from core.exceptions import AgentException
+from core.exceptions import AgentException, TimeoutException
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TaskConfig:
+    """任务配置数据类"""
+    task_type: str
+    prompt_template: str
+    default_result: Dict[str, Any]
+    context_builder: Callable
+    result_validator: Callable
+    success_message: str
+
 
 class CoachAgent(BaseAgent):
     """写作助教智能体"""
+    
+    # 常量定义
+    MAX_CONTENT_LENGTH = 10000  # 最大内容长度
+    DEFAULT_TIMEOUT = 60  # 默认超时时间（秒）
     
     def __init__(self, llm=None):
         super().__init__("Coach", llm)
@@ -25,31 +45,99 @@ class CoachAgent(BaseAgent):
         self.add_tool("mimic_style", self._mimic_style, "模仿写作风格")
         self.add_tool("get_user_style", self._get_user_style, "获取用户写作风格")
         self.add_tool("suggest_improvements", self._suggest_improvements, "建议改进")
+        
+        # 缓存
+        self._user_context_cache = {}
+        self._cache_ttl = 300  # 缓存有效期 5 分钟
+        
+        # 初始化任务配置
+        self._task_configs = self._initialize_task_configs()
+    
+    def _initialize_task_configs(self) -> Dict[str, TaskConfig]:
+        """初始化任务配置"""
+        return {
+            "explain": TaskConfig(
+                task_type="explain",
+                prompt_template=self._build_explain_prompt,
+                default_result={
+                    "explanation": "解释生成失败",
+                    "examples": [],
+                    "importance": "",
+                    "applications": []
+                },
+                context_builder=self._build_explain_context,
+                result_validator=self._ensure_explanation_fields,
+                success_message="解释任务完成"
+            ),
+            "polish": TaskConfig(
+                task_type="polish",
+                prompt_template=self._build_polish_prompt,
+                default_result={
+                    "polished_text": "",
+                    "modifications": ["润色失败: 使用原文"],
+                    "style_suggestions": [],
+                    "references": []
+                },
+                context_builder=self._build_polish_context,
+                result_validator=self._ensure_polish_fields,
+                success_message="润色任务完成"
+            ),
+            "mimic": TaskConfig(
+                task_type="mimic",
+                prompt_template=self._build_mimic_prompt,
+                default_result={
+                    "rewritten_text": "",
+                    "style_analysis": "模仿失败: 使用原文",
+                    "mimic_techniques": [],
+                    "reference_structures": []
+                },
+                context_builder=self._build_mimic_context,
+                result_validator=self._ensure_mimic_fields,
+                success_message="模仿任务完成"
+            ),
+            "suggest": TaskConfig(
+                task_type="suggest",
+                prompt_template=self._build_suggest_prompt,
+                default_result={
+                    "overall_evaluation": "分析失败",
+                    "improvement_suggestions": [],
+                    "grammar_issues": [],
+                    "structure_suggestions": [],
+                    "academic_improvements": []
+                },
+                context_builder=self._build_suggest_context,
+                result_validator=self._ensure_suggest_fields,
+                success_message="建议任务完成"
+            )
+        }
     
     async def run(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """执行写作助教任务"""
         await self.validate_input(input_data)
         
         self.set_state("running")
+        start_time = datetime.now()
         
         try:
             user_id = input_data["user_id"]
-            task_type = input_data["task_type"]  # explain, polish, mimic, suggest
+            task_type = input_data["task_type"]
             content = input_data["content"]
             context = input_data.get("context", {})
             
-            result = None
+            # 输入验证
+            self._validate_content(content)
             
-            if task_type == "explain":
-                result = await self._handle_explain_task(user_id, content, context)
-            elif task_type == "polish":
-                result = await self._handle_polish_task(user_id, content, context)
-            elif task_type == "mimic":
-                result = await self._handle_mimic_task(user_id, content, context)
-            elif task_type == "suggest":
-                result = await self._handle_suggest_task(user_id, content, context)
-            else:
+            # 验证任务类型
+            if task_type not in self._task_configs:
                 raise AgentException(f"不支持的任务类型: {task_type}")
+            
+            logger.info(f"Coach Agent 开始执行任务: user_id={user_id}, task_type={task_type}")
+            
+            # 使用统一的任务处理框架
+            result = await self._execute_task(user_id, content, context, task_type)
+            
+            elapsed = (datetime.now() - start_time).total_seconds()
+            logger.info(f"Coach Agent 任务完成: task_type={task_type}, elapsed={elapsed:.2f}s")
             
             self.set_state("completed")
             
@@ -58,243 +146,336 @@ class CoachAgent(BaseAgent):
                 "task_type": task_type,
                 "user_id": user_id,
                 "result": result,
+                "processing_time_seconds": round(elapsed, 2),
                 "timestamp": datetime.now().isoformat()
             }
             
+        except (AgentException, TimeoutException):
+            raise
         except Exception as e:
             self.set_state("error")
+            logger.error(f"Coach Agent 执行失败: user_id={input_data.get('user_id')}, error={str(e)}", exc_info=True)
             raise AgentException(f"Coach Agent执行失败: {str(e)}")
     
     def get_required_fields(self) -> List[str]:
         """获取必需的输入字段"""
         return ["user_id", "task_type", "content"]
     
-    async def _handle_explain_task(self, user_id: str, content: str, context: Dict) -> Dict[str, Any]:
-        """处理解释任务"""
-        try:
-            # 获取用户的历史论文作为上下文
-            user_context = await self._get_user_context(user_id)
-            
-            explain_prompt = f"""
-            请用通俗易懂的语言解释以下内容：
-            
-            需要解释的内容：
-            {content}
-            
-            上下文信息：
-            {json.dumps(context, ensure_ascii=False, indent=2)}
-            
-            用户研究领域背景：
-            {json.dumps(user_context, ensure_ascii=False, indent=2)}
-            
-            请提供：
-            1. 简单易懂的解释
-            2. 相关的例子或类比
-            3. 在该领域的重要性
-            4. 可能的应用场景
-            
-            请以JSON格式返回结果。
-            """
-            
-            response = await self.think(explain_prompt)
-            
-            try:
-                result = json.loads(response)
-            except json.JSONDecodeError:
-                result = {
-                    "explanation": response,
-                    "examples": ["需要补充具体例子"],
-                    "importance": "在相关领域具有重要意义",
-                    "applications": ["潜在应用场景"]
-                }
-            
-            self._add_to_history(f"完成解释任务: {content[:50]}...")
-            return result
-            
-        except Exception as e:
-            self._add_to_history(f"解释任务失败: {str(e)}")
-            return {
-                "explanation": f"解释过程中出现错误: {str(e)}",
-                "examples": [],
-                "importance": "",
-                "applications": []
-            }
+    def _validate_content(self, content: str):
+        """验证内容输入"""
+        if not content or not content.strip():
+            raise AgentException("内容不能为空")
+        
+        if len(content) > self.MAX_CONTENT_LENGTH:
+            raise AgentException(
+                f"内容长度超过限制: {len(content)} > {self.MAX_CONTENT_LENGTH}"
+            )
     
-    async def _handle_polish_task(self, user_id: str, content: str, context: Dict) -> Dict[str, Any]:
-        """处理润色任务"""
+    async def _execute_task(self, user_id: str, content: str, context: Dict, task_type: str) -> Dict[str, Any]:
+        """
+        统一的任务执行框架（模板方法）
+        
+        Args:
+            user_id: 用户ID
+            content: 待处理内容
+            context: 上下文信息
+            task_type: 任务类型
+            
+        Returns:
+            任务执行结果
+        """
+        config = self._task_configs[task_type]
+        
         try:
-            # 获取用户的写作风格偏好
-            user_style = await self._get_user_writing_style(user_id)
+            # 1. 构建上下文
+            task_context = await config.context_builder(user_id, content, context)
             
-            # 获取相关的风格参考
-            style_references = await self._get_style_references(user_id, content)
+            # 2. 构建 prompt
+            prompt = config.prompt_template(content, task_context)
             
-            polish_prompt = f"""
-            请将以下文本润色为地道的学术英语：
+            # 3. 调用 LLM
+            response = await self.think(prompt)
             
-            原文：
-            {content}
+            # 4. 解析响应
+            result = self._parse_llm_json_response(response, config.default_result.copy())
             
-            用户写作风格偏好：
-            {json.dumps(user_style, ensure_ascii=False, indent=2)}
+            # 5. 验证和补全结果字段
+            result = config.result_validator(result, config.default_result)
             
-            风格参考：
-            {json.dumps(style_references, ensure_ascii=False, indent=2)}
+            # 6. 记录成功日志
+            logger.info(f"{config.success_message}: user_id={user_id}, content_length={len(content)}")
+            self._add_to_history(f"完成{config.task_type}任务: {content[:50]}...")
             
-            上下文信息：
-            {json.dumps(context, ensure_ascii=False, indent=2)}
-            
-            请提供：
-            1. 润色后的英文文本
-            2. 主要修改说明
-            3. 风格改进建议
-            4. 参考的论文句式来源
-            
-            要求：
-            - 保持原意不变
-            - 使用地道的学术表达
-            - 符合目标期刊/会议的写作风格
-            - 在注释中说明参考了哪些历史论文的句式
-            
-            请以JSON格式返回结果。
-            """
-            
-            response = await self.think(polish_prompt)
-            
-            try:
-                result = json.loads(response)
-            except json.JSONDecodeError:
-                result = {
-                    "polished_text": response,
-                    "modifications": ["语法修正", "词汇优化"],
-                    "style_suggestions": ["建议使用更正式的表达"],
-                    "references": ["基于学术写作规范"]
-                }
-            
-            self._add_to_history(f"完成润色任务: {content[:50]}...")
             return result
             
-        except Exception as e:
-            self._add_to_history(f"润色任务失败: {str(e)}")
-            return {
-                "polished_text": content,
-                "modifications": [f"润色过程中出现错误: {str(e)}"],
-                "style_suggestions": [],
-                "references": []
+        except TimeoutException:
+            logger.warning(f"{config.task_type}任务超时: user_id={user_id}")
+            default_result = config.default_result.copy()
+            # 根据任务类型设置超时消息
+            timeout_messages = {
+                "explain": "解释生成超时，请稍后重试",
+                "polish": "润色超时，请稍后重试",
+                "mimic": "模仿超时，请稍后重试",
+                "suggest": "分析超时，请稍后重试"
             }
+            first_key = next(iter(default_result.keys()))
+            default_result[first_key] = timeout_messages.get(config.task_type, "任务超时")
+            return default_result
+            
+        except Exception as e:
+            logger.error(f"{config.task_type}任务失败: user_id={user_id}, error={str(e)}", exc_info=True)
+            default_result = config.default_result.copy()
+            first_key = next(iter(default_result.keys()))
+            default_result[first_key] = f"任务执行失败: {str(e)}"
+            return default_result
     
-    async def _handle_mimic_task(self, user_id: str, content: str, context: Dict) -> Dict[str, Any]:
-        """处理模仿任务"""
+    def _parse_llm_json_response(self, response: str, default_result: Dict) -> Dict:
+        """
+        解析 LLM 返回的 JSON 响应
+        
+        Args:
+            response: LLM 返回的原始文本
+            default_result: 解析失败时的默认返回值
+            
+        Returns:
+            解析后的字典
+        """
+        if not response:
+            logger.warning("LLM 返回空响应")
+            return default_result
+        
+        # 尝试直接解析
         try:
-            # 获取目标风格参考
-            target_style = context.get("target_style", "formal_academic")
-            reference_papers = context.get("reference_papers", [])
-            
-            # 如果没有指定参考论文，从用户库中获取
-            if not reference_papers:
-                reference_papers = await self._get_user_top_papers(user_id, limit=3)
-            
-            mimic_prompt = f"""
-            请基于以下参考论文的写作风格，重写给定内容：
-            
-            原文：
-            {content}
-            
-            目标风格：
-            {target_style}
-            
-            参考论文：
-            {json.dumps(reference_papers, ensure_ascii=False, indent=2)}
-            
-            上下文信息：
-            {json.dumps(context, ensure_ascii=False, indent=2)}
-            
-            请提供：
-            1. 重写后的文本
-            2. 风格分析（说明如何体现目标风格）
-            3. 具体的模仿技巧
-            4. 参考的句式结构
-            
-            请以JSON格式返回结果。
-            """
-            
-            response = await self.think(mimic_prompt)
-            
+            return json.loads(response)
+        except json.JSONDecodeError:
+            pass
+        
+        # 尝试提取 JSON 代码块
+        import re
+        json_pattern = r'```(?:json)?\s*(.*?)\s*```'
+        match = re.search(json_pattern, response, re.DOTALL)
+        if match:
             try:
-                result = json.loads(response)
+                return json.loads(match.group(1))
             except json.JSONDecodeError:
-                result = {
-                    "rewritten_text": response,
-                    "style_analysis": "基于学术写作风格进行重写",
-                    "mimic_techniques": ["句式结构模仿", "词汇选择"],
-                    "reference_structures": ["学术表达方式"]
-                }
-            
-            self._add_to_history(f"完成模仿任务: {content[:50]}...")
-            return result
-            
-        except Exception as e:
-            self._add_to_history(f"模仿任务失败: {str(e)}")
-            return {
-                "rewritten_text": content,
-                "style_analysis": f"模仿过程中出现错误: {str(e)}",
-                "mimic_techniques": [],
-                "reference_structures": []
-            }
+                pass
+        
+        # 尝试找到第一个 { 和最后一个 }
+        start_idx = response.find('{')
+        end_idx = response.rfind('}')
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            try:
+                json_str = response[start_idx:end_idx + 1]
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                pass
+        
+        logger.warning(f"无法解析 LLM JSON 响应，使用默认值。响应前100字符: {response[:100]}")
+        return default_result
     
-    async def _handle_suggest_task(self, user_id: str, content: str, context: Dict) -> Dict[str, Any]:
-        """处理建议任务"""
-        try:
-            # 获取用户的历史写作数据
-            user_writing_history = await self._get_user_writing_history(user_id)
-            
-            suggest_prompt = f"""
-            请对以下文本提供改进建议：
-            
-            文本内容：
-            {content}
-            
-            用户写作历史：
-            {json.dumps(user_writing_history, ensure_ascii=False, indent=2)}
-            
-            上下文信息：
-            {json.dumps(context, ensure_ascii=False, indent=2)}
-            
-            请提供：
-            1. 整体评价
-            2. 具体改进建议（按重要性排序）
-            3. 语法和表达问题
-            4. 结构优化建议
-            5. 学术表达改进
-            
-            请以JSON格式返回结果。
-            """
-            
-            response = await self.think(suggest_prompt)
-            
-            try:
-                result = json.loads(response)
-            except json.JSONDecodeError:
-                result = {
-                    "overall_evaluation": "文本整体质量良好",
-                    "improvement_suggestions": ["建议加强逻辑表达", "可以增加更多细节"],
-                    "grammar_issues": ["检查时态一致性"],
-                    "structure_suggestions": ["建议优化段落结构"],
-                    "academic_improvements": ["使用更正式的学术词汇"]
-                }
-            
-            self._add_to_history(f"完成建议任务: {content[:50]}...")
-            return result
-            
-        except Exception as e:
-            self._add_to_history(f"建议任务失败: {str(e)}")
-            return {
-                "overall_evaluation": f"分析过程中出现错误: {str(e)}",
-                "improvement_suggestions": [],
-                "grammar_issues": [],
-                "structure_suggestions": [],
-                "academic_improvements": []
-            }
+    async def _get_cached_user_context(self, user_id: str) -> Dict[str, Any]:
+        """获取缓存的用户上下文"""
+        import time
+        current_time = time.time()
+        
+        if user_id in self._user_context_cache:
+            cache_data = self._user_context_cache[user_id]
+            if current_time - cache_data['timestamp'] < self._cache_ttl:
+                return cache_data['data']
+        
+        # 缓存失效或未找到，重新获取
+        user_context = await self._get_user_context(user_id)
+        self._user_context_cache[user_id] = {
+            'data': user_context,
+            'timestamp': current_time
+        }
+        
+        return user_context
+    
+    # ==================== 上下文构建器 ====================
+    
+    async def _build_explain_context(self, user_id: str, content: str, context: Dict) -> Dict:
+        """构建解释任务的上下文"""
+        user_context = await self._get_cached_user_context(user_id)
+        return {
+            "user_context": user_context,
+            "additional_context": context
+        }
+    
+    async def _build_polish_context(self, user_id: str, content: str, context: Dict) -> Dict:
+        """构建润色任务的上下文"""
+        user_style = await self._get_user_writing_style(user_id)
+        style_references = await self._get_style_references(user_id, content)
+        return {
+            "user_style": user_style,
+            "style_references": style_references,
+            "additional_context": context
+        }
+    
+    async def _build_mimic_context(self, user_id: str, content: str, context: Dict) -> Dict:
+        """构建模仿任务的上下文"""
+        target_style = context.get("target_style", "formal_academic")
+        reference_papers = context.get("reference_papers", [])
+        
+        if not reference_papers:
+            reference_papers = await self._get_user_top_papers(user_id, limit=3)
+        
+        return {
+            "target_style": target_style,
+            "reference_papers": reference_papers,
+            "additional_context": context
+        }
+    
+    async def _build_suggest_context(self, user_id: str, content: str, context: Dict) -> Dict:
+        """构建建议任务的上下文"""
+        user_writing_history = await self._get_user_writing_history(user_id)
+        return {
+            "user_writing_history": user_writing_history,
+            "additional_context": context
+        }
+    
+    # ==================== Prompt 构建器 ====================
+    
+    def _build_explain_prompt(self, content: str, task_context: Dict) -> str:
+        """构建解释任务的 prompt"""
+        user_context = task_context["user_context"]
+        additional_context = task_context["additional_context"]
+        
+        return f"""请用通俗易懂的语言解释以下内容：
+
+需要解释的内容：
+{content}
+
+上下文信息：
+{json.dumps(additional_context, ensure_ascii=False, indent=2)}
+
+用户研究领域背景：
+{json.dumps(user_context, ensure_ascii=False, indent=2)}
+
+请提供：
+1. 简单易懂的解释
+2. 相关的例子或类比
+3. 在该领域的重要性
+4. 可能的应用场景
+
+请以JSON格式返回结果，不要包含Markdown代码块标记。"""
+    
+    def _build_polish_prompt(self, content: str, task_context: Dict) -> str:
+        """构建润色任务的 prompt"""
+        user_style = task_context["user_style"]
+        style_references = task_context["style_references"]
+        additional_context = task_context["additional_context"]
+        
+        return f"""请将以下文本润色为地道的学术英语：
+
+原文：
+{content}
+
+用户写作风格偏好：
+{json.dumps(user_style, ensure_ascii=False, indent=2)}
+
+风格参考：
+{json.dumps(style_references, ensure_ascii=False, indent=2)}
+
+上下文信息：
+{json.dumps(additional_context, ensure_ascii=False, indent=2)}
+
+请提供：
+1. 润色后的英文文本
+2. 主要修改说明
+3. 风格改进建议
+4. 参考的论文句式来源
+
+要求：
+- 保持原意不变
+- 使用地道的学术表达
+- 符合目标期刊/会议的写作风格
+- 在注释中说明参考了哪些历史论文的句式
+
+请以JSON格式返回结果，不要包含Markdown代码块标记。"""
+    
+    def _build_mimic_prompt(self, content: str, task_context: Dict) -> str:
+        """构建模仿任务的 prompt"""
+        target_style = task_context["target_style"]
+        reference_papers = task_context["reference_papers"]
+        additional_context = task_context["additional_context"]
+        
+        return f"""请基于以下参考论文的写作风格，重写给定内容：
+
+原文：
+{content}
+
+目标风格：
+{target_style}
+
+参考论文：
+{json.dumps(reference_papers, ensure_ascii=False, indent=2)}
+
+上下文信息：
+{json.dumps(additional_context, ensure_ascii=False, indent=2)}
+
+请提供：
+1. 重写后的文本
+2. 风格分析（说明如何体现目标风格）
+3. 具体的模仿技巧
+4. 参考的句式结构
+
+请以JSON格式返回结果，不要包含Markdown代码块标记。"""
+    
+    def _build_suggest_prompt(self, content: str, task_context: Dict) -> str:
+        """构建建议任务的 prompt"""
+        user_writing_history = task_context["user_writing_history"]
+        additional_context = task_context["additional_context"]
+        
+        return f"""请对以下文本提供改进建议：
+
+文本内容：
+{content}
+
+用户写作历史：
+{json.dumps(user_writing_history, ensure_ascii=False, indent=2)}
+
+上下文信息：
+{json.dumps(additional_context, ensure_ascii=False, indent=2)}
+
+请提供：
+1. 整体评价
+2. 具体改进建议（按重要性排序）
+3. 语法和表达问题
+4. 结构优化建议
+5. 学术表达改进
+
+请以JSON格式返回结果，不要包含Markdown代码块标记。"""
+    
+    # ==================== 结果验证器 ====================
+    
+    def _ensure_explanation_fields(self, result: Dict, default: Dict) -> Dict:
+        """确保解释结果包含所有必需字段"""
+        for key in default.keys():
+            if key not in result:
+                result[key] = default[key]
+        return result
+    
+    def _ensure_polish_fields(self, result: Dict, default: Dict) -> Dict:
+        """确保润色结果包含所有必需字段"""
+        for key in default.keys():
+            if key not in result:
+                result[key] = default[key]
+        return result
+    
+    def _ensure_mimic_fields(self, result: Dict, default: Dict) -> Dict:
+        """确保模仿结果包含所有必需字段"""
+        for key in default.keys():
+            if key not in result:
+                result[key] = default[key]
+        return result
+    
+    def _ensure_suggest_fields(self, result: Dict, default: Dict) -> Dict:
+        """确保建议结果包含所有必需字段"""
+        for key in default.keys():
+            if key not in result:
+                result[key] = default[key]
+        return result
     
     async def _get_user_context(self, user_id: str) -> Dict[str, Any]:
         """获取用户的研究背景"""
@@ -303,12 +484,13 @@ class CoachAgent(BaseAgent):
             if user:
                 return user.get("profile", {})
             return {}
-        except Exception:
+        except Exception as e:
+            logger.warning(f"获取用户上下文失败: user_id={user_id}, error={str(e)}")
             return {}
     
     async def _get_user_writing_style(self, user_id: str) -> Dict[str, Any]:
         """获取用户写作风格偏好"""
-        user_context = await self._get_user_context(user_id)
+        user_context = await self._get_cached_user_context(user_id)
         return user_context.get("writing_style", {
             "tone": "formal",
             "complexity": "medium",
@@ -339,7 +521,8 @@ class CoachAgent(BaseAgent):
             
             return references
             
-        except Exception:
+        except Exception as e:
+            logger.warning(f"获取风格参考失败: user_id={user_id}, error={str(e)}")
             return []
     
     async def _get_user_top_papers(self, user_id: str, limit: int = 3) -> List[Dict[str, Any]]:
@@ -358,13 +541,14 @@ class CoachAgent(BaseAgent):
             
             return top_papers
             
-        except Exception:
+        except Exception as e:
+            logger.warning(f"获取用户论文失败: user_id={user_id}, error={str(e)}")
             return []
     
     async def _get_user_writing_history(self, user_id: str) -> List[Dict[str, Any]]:
         """获取用户写作历史"""
         try:
-            # 这里应该从用户的写作历史记录中获取数据
+            # TODO: 从数据库获取真实的写作历史记录
             # 暂时返回模拟数据
             return [
                 {
@@ -374,35 +558,26 @@ class CoachAgent(BaseAgent):
                     "feedback_score": 4.5
                 }
             ]
-        except Exception:
+        except Exception as e:
+            logger.warning(f"获取写作历史失败: user_id={user_id}, error={str(e)}")
             return []
     
     # 工具方法
     async def _explain_concept(self, concept: str, context: Dict = None) -> Dict:
         """解释概念工具"""
-        return await self._handle_explain_task(
-            context.get("user_id", ""), 
-            concept, 
-            context or {}
-        )
+        ctx = context or {}
+        return await self._handle_legacy_task("explain", ctx.get("user_id", ""), concept, ctx)
     
     async def _polish_text(self, text: str, context: Dict = None) -> Dict:
         """润色文本工具"""
-        return await self._handle_polish_task(
-            context.get("user_id", ""), 
-            text, 
-            context or {}
-        )
+        ctx = context or {}
+        return await self._handle_legacy_task("polish", ctx.get("user_id", ""), text, ctx)
     
     async def _mimic_style(self, text: str, target_style: str, context: Dict = None) -> Dict:
         """模仿风格工具"""
         ctx = context or {}
         ctx["target_style"] = target_style
-        return await self._handle_mimic_task(
-            ctx.get("user_id", ""), 
-            text, 
-            ctx
-        )
+        return await self._handle_legacy_task("mimic", ctx.get("user_id", ""), text, ctx)
     
     async def _get_user_style(self, user_id: str) -> Dict:
         """获取用户风格工具"""
@@ -410,8 +585,20 @@ class CoachAgent(BaseAgent):
     
     async def _suggest_improvements(self, text: str, context: Dict = None) -> Dict:
         """建议改进工具"""
-        return await self._handle_suggest_task(
-            context.get("user_id", ""), 
-            text, 
-            context or {}
-        )
+        ctx = context or {}
+        return await self._handle_legacy_task("suggest", ctx.get("user_id", ""), text, ctx)
+    
+    async def _handle_legacy_task(self, task_type: str, user_id: str, content: str, context: Dict) -> Dict:
+        """
+        兼容旧的工具调用方式
+        直接调用统一的任务执行框架
+        """
+        if task_type not in self._task_configs:
+            raise AgentException(f"不支持的任务类型: {task_type}")
+        
+        return await self._execute_task(user_id, content, context, task_type)
+    
+    def clear_cache(self):
+        """清除缓存"""
+        self._user_context_cache.clear()
+        logger.info("Coach Agent 缓存已清除")
