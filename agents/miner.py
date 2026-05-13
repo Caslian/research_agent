@@ -13,12 +13,16 @@ from agents.base import BaseAgent
 from core.database import db_manager
 from core.vector_store import vector_store_manager
 from core.exceptions import AgentException
+from utils.research_paper_parser import ResearchPaperParser, ResearchPaper
 
 class MinerAgent(BaseAgent):
     """洞察专家智能体"""
     
     def __init__(self, llm=None):
         super().__init__("Miner", llm)
+        
+        # 初始化论文解析器
+        self.paper_parser = ResearchPaperParser()
         
         # 添加工具
         self.add_tool("parse_pdf", self._parse_pdf, "解析PDF文件")
@@ -106,55 +110,62 @@ class MinerAgent(BaseAgent):
     async def _parse_paper_content(self, paper: Dict) -> Dict[str, Any]:
         """解析论文内容"""
         file_path = paper.get("file_path")
-        if not file_path:
-            # 如果没有PDF文件，使用标题和摘要
-            return {
-                "title": paper.get("title", ""),
-                "abstract": paper.get("abstract", ""),
-                "sections": {
-                    "abstract": paper.get("abstract", ""),
-                    "introduction": "",
-                    "method": "",
-                    "experiment": "",
-                    "conclusion": ""
-                },
-                "word_count": len(paper.get("abstract", "").split()),
-                "parsing_method": "metadata_only"
-            }
         
-        # 这里应该使用专门的PDF解析库
-        # 暂时返回模拟的结构化内容
-        return await self._extract_structured_content(file_path)
+        # 如果有PDF文件，使用深度解析器
+        if file_path:
+            parsed_paper = await self.paper_parser.parse_paper(file_path, extract_keywords=True)
+            if parsed_paper:
+                return await self._convert_paper_to_dict(parsed_paper)
+        
+        # 如果没有PDF文件，使用基础元数据
+        self._add_to_history(f"使用元数据进行解析: {paper.get('title', '')}")
+        return {
+            "title": paper.get("title", ""),
+            "abstract": paper.get("abstract", ""),
+            "authors": paper.get("authors", []),
+            "sections": {
+                "abstract": paper.get("abstract", ""),
+                "introduction": "",
+                "method": "",
+                "experiment": "",
+                "conclusion": ""
+            },
+            "key_terms": [],
+            "word_count": len(paper.get("abstract", "").split()),
+            "parsing_method": "metadata_only",
+            "parsing_time": "0.00s"
+        }
     
     async def _extract_structured_content(self, file_path: str) -> Dict[str, Any]:
-        """提取结构化内容"""
+        """提取结构化内容 - 使用深度解析器"""
         try:
-            # 这里应该集成Nougat或PyMuPDF进行深度解析
-            # 暂时返回模拟数据
-            mock_content = {
-                "title": "Sample Paper Title",
-                "abstract": "This is a sample abstract...",
-                "sections": {
-                    "introduction": "In this paper, we propose...",
-                    "method": "Our method consists of...",
-                    "experiment": "We conducted experiments...",
-                    "conclusion": "The results show that..."
-                },
-                "word_count": 1500,
-                "parsing_method": "mock_parser"
-            }
+            # 使用 ResearchPaperParser 进行深度解析
+            parsed_paper = await self.paper_parser.parse_paper(file_path, extract_keywords=True)
             
-            self._add_to_history(f"PDF解析完成: {file_path}")
-            return mock_content
+            if not parsed_paper:
+                self._add_to_history(f"PDF解析失败: {file_path}")
+                return {
+                    "title": "",
+                    "abstract": "",
+                    "sections": {},
+                    "word_count": 0,
+                    "parsing_method": "failed",
+                    "error": "无法解析PDF文件"
+                }
+            
+            result = await self._convert_paper_to_dict(parsed_paper)
+            self._add_to_history(f"PDF深度解析完成: {parsed_paper.metadata.title}")
+            return result
             
         except Exception as e:
-            self._add_to_history(f"PDF解析失败: {str(e)}")
+            self._add_to_history(f"PDF解析异常: {str(e)}")
             return {
                 "title": "",
                 "abstract": "",
                 "sections": {},
                 "word_count": 0,
-                "parsing_method": "failed"
+                "parsing_method": "failed",
+                "error": str(e)
             }
     
     async def _find_related_papers(self, title: str, abstract: str, user_id: str = None) -> List[Dict]:
@@ -193,34 +204,54 @@ class MinerAgent(BaseAgent):
             return []
     
     async def _perform_comparison_analysis(self, current_paper: Dict, related_papers: List[Dict]) -> Dict[str, Any]:
-        """执行对比分析"""
+        """执行对比分析 - 利用深度解析结果"""
         if not related_papers:
             return {
                 "comparison_summary": "未找到相关论文进行对比",
                 "unique_contributions": [],
                 "similar_works": [],
-                "gaps_identified": []
+                "gaps_identified": [],
+                "method_comparison": ""
             }
         
-        # 构建对比分析的prompt
+        # 提取关键技术术语用于对比
+        current_key_terms = current_paper.get("key_terms", [])
+        current_sections = current_paper.get("sections", {})
+        current_insights = current_paper.get("insights", {})
+        
+        # 构建高度结构化的对比分析prompt
         comparison_prompt = f"""
-        请分析当前论文与历史相关论文的对比情况：
+        基于以下详细分析结果，进行深度对比分析：
         
         当前论文：
         标题：{current_paper.get('title', '')}
+        作者：{', '.join(current_paper.get('authors', []))}
         摘要：{current_paper.get('abstract', '')}
-        主要内容：{str(current_paper.get('sections', {}))[:1000]}...
+        关键词：{', '.join([t[0] for t in current_key_terms[:5]])}
         
-        相关论文：
+        创新指标：{current_insights.get('innovation_indicators', [])}
+        方法论新颖性：{current_insights.get('methodology_novelty', '')}
+        
+        论文结构：
+        {self._format_sections_for_comparison(current_sections)}
+        
+        相关论文对比：
         {self._format_related_papers_for_comparison(related_papers[:5])}
         
-        请从以下角度进行对比分析：
-        1. 方法的创新性和改进点
-        2. 实验设计的优势
-        3. 与现有工作的区别
-        4. 可能的研究空白
+        请从以下维度进行深度对比分析：
+        1. **方法创新性**：与相关论文相比的方法改进
+        2. **实验设计**：实验的新颖性和完整性评估
+        3. **技术突破**：关键技术术语和创新点对比
+        4. **研究空白**：当前文献中未覆盖的领域
+        5. **应用价值**：相比现有工作的实际应用潜力
         
-        请以JSON格式返回分析结果。
+        返回JSON格式的分析结果，包含：
+        - comparison_summary：总体对比总结
+        - unique_contributions：独特贡献列表
+        - similar_works：相似工作列表
+        - gaps_identified：发现的研究空白
+        - method_comparison：方法对比详情
+        - future_potential：未来研究潜力评估
         """
         
         try:
@@ -233,7 +264,7 @@ class MinerAgent(BaseAgent):
                 # 如果JSON解析失败，使用文本解析
                 comparison_result = self._parse_text_comparison(response)
             
-            self._add_to_history("对比分析完成")
+            self._add_to_history("深度对比分析完成")
             return comparison_result
             
         except Exception as e:
@@ -242,8 +273,19 @@ class MinerAgent(BaseAgent):
                 "comparison_summary": "对比分析过程中出现错误",
                 "unique_contributions": [],
                 "similar_works": [],
-                "gaps_identified": []
+                "gaps_identified": [],
+                "method_comparison": str(e)
             }
+    
+    def _format_sections_for_comparison(self, sections: Dict) -> str:
+        """格式化论文部分用于对比"""
+        formatted = []
+        for section_name, section_data in sections.items():
+            if isinstance(section_data, dict):
+                content_preview = section_data.get("content", "")[:200]
+                word_count = section_data.get("word_count", 0)
+                formatted.append(f"- {section_name}: {word_count}字，内容摘要：{content_preview}...")
+        return "\n".join(formatted) if formatted else "无详细部分信息"
     
     def _format_related_papers_for_comparison(self, papers: List[Dict]) -> str:
         """格式化相关论文用于对比"""
@@ -270,29 +312,51 @@ class MinerAgent(BaseAgent):
     async def _create_analysis_report(self, paper: Dict, parsed_content: Dict, 
                                     related_papers: List[Dict], comparison_result: Dict,
                                     user_id: str = None) -> Dict[str, Any]:
-        """创建分析报告"""
+        """创建分析报告 - 利用深度解析结果"""
         
+        # 提取关键信息
+        sections_info = parsed_content.get("sections", {})
+        key_terms = parsed_content.get("key_terms", [])
+        insights = parsed_content.get("insights", {})
+        parsing_time = parsed_content.get("parsing_time", "0.00s")
+        
+        # 构建高质量的分析report prompt
         report_prompt = f"""
-        基于以下信息，生成一份详细的论文分析报告：
+        基于以下深度论文分析结果，生成一份高质量的学术分析报告：
         
-        论文信息：
+        **论文基本信息**
         标题：{paper.get('title', '')}
         作者：{', '.join(paper.get('authors', []))}
-        摘要：{paper.get('abstract', '')}
+        关键词：{', '.join(paper.get('keywords', []))}
         
-        解析内容：
-        {str(parsed_content.get('sections', {}))[:1500]}...
+        **论文摘要**
+        {paper.get('abstract', '')}
         
-        对比分析结果：
-        {str(comparison_result)[:1000]}...
+        **提取的关键术语（按重要性排序）**
+        {self._format_key_terms(key_terms[:10])}
         
-        请生成包含以下部分的报告：
-        1. Summary - 论文主要贡献和方法概述
-        2. Innovation - 相比相关论文的创新点
-        3. Limitation - 当前研究的局限性
-        4. Future Ideas - 基于分析的未来研究方向建议
+        **论文结构分析**
+        {self._format_sections_info(sections_info)}
         
-        请以JSON格式返回报告。
+        **创新指标**
+        {json.dumps(insights, ensure_ascii=False, indent=2)}
+        
+        **对比分析结果**
+        {json.dumps(comparison_result, ensure_ascii=False, indent=2)}
+        
+        **相关研究数量**：{len(related_papers)} 篇
+        
+        请生成包含以下部分的详细分析报告（JSON格式）：
+        
+        1. **Summary** - 论文主要贡献、研究方法和关键发现的全面概述
+        2. **Innovation** - 相比相关论文的具体创新点和技术突破
+        3. **Technical Novelty** - 技术方法的创新程度评估
+        4. **Experimental Validation** - 实验设计的完整性和有效性评估
+        5. **Limitation** - 当前研究存在的局限性和改进空间
+        6. **Future Ideas** - 基于分析建议的未来研究方向和扩展工作
+        7. **Impact Potential** - 该研究的潜在应用价值和影响力
+        
+        返回JSON格式，每个字段是字符串或列表。
         """
         
         try:
@@ -305,32 +369,95 @@ class MinerAgent(BaseAgent):
                 # 如果JSON解析失败，生成默认报告
                 report = self._generate_default_report(paper, parsed_content, comparison_result)
             
-            # 添加元数据
+            # 添加元数据和分析信息
             report.update({
                 "paper_id": paper.get("id"),
+                "paper_title": paper.get("title", ""),
                 "generated_for_user_id": user_id,
                 "generated_at": datetime.now().isoformat(),
                 "related_papers_count": len(related_papers),
-                "analysis_method": "miner_agent"
+                "parsing_details": {
+                    "sections_identified": len(sections_info),
+                    "key_terms_extracted": len(key_terms),
+                    "parsing_method": parsed_content.get("parsing_method", "unknown"),
+                    "parsing_time": parsing_time
+                },
+                "analysis_method": "deepened_miner_agent",
+                "model_version": "v2.1"
             })
             
-            self._add_to_history("分析报告生成完成")
+            self._add_to_history("深度分析报告生成完成")
             return report
             
         except Exception as e:
             self._add_to_history(f"生成分析报告失败: {str(e)}")
             return self._generate_default_report(paper, parsed_content, comparison_result)
     
+    def _format_key_terms(self, key_terms: List) -> str:
+        """格式化关键术语"""
+        if not key_terms:
+            return "暂无关键术语"
+        formatted = []
+        for i, (term, score) in enumerate(key_terms, 1):
+            formatted.append(f"{i}. {term} (重要性: {score:.2f})")
+        return "\n".join(formatted)
+    
+    def _format_sections_info(self, sections: Dict) -> str:
+        """格式化部分信息"""
+        if not sections:
+            return "未识别出结构化部分"
+        formatted = []
+        for name, section_data in sections.items():
+            if isinstance(section_data, dict):
+                word_count = section_data.get("word_count", 0)
+                formatted.append(f"- **{name}**: {word_count} 字")
+        return "\n".join(formatted) if formatted else "部分结构信息不可用"
+    
+    async def _convert_paper_to_dict(self, paper: ResearchPaper) -> Dict[str, Any]:
+        """将 ResearchPaper 对象转换为字典"""
+        sections_dict = {}
+        for name, section in paper.sections.items():
+            sections_dict[name] = {
+                "content": section.content,
+                "word_count": section.word_count
+            }
+        
+        # 提取创新洞察
+        insights = self.paper_parser.extract_innovation_insights(paper)
+        
+        return {
+            "title": paper.metadata.title,
+            "abstract": paper.metadata.abstract,
+            "authors": paper.metadata.authors,
+            "keywords": paper.metadata.keywords,
+            "sections": sections_dict,
+            "key_terms": paper.key_terms,
+            "insights": insights,
+            "word_count": paper.total_word_count,
+            "page_count": paper.page_count,
+            "parsing_method": paper.parsing_method,
+            "parsing_time": paper.parsing_time
+        }
+    
     def _generate_default_report(self, paper: Dict, parsed_content: Dict, comparison_result: Dict) -> Dict[str, Any]:
         """生成默认报告"""
+        # 从解析内容中提取关键信息
+        key_terms = parsed_content.get("key_terms", [])
+        insights = parsed_content.get("insights", {})
+        
+        innovation_points = [
+            f"关键术语: {', '.join([t[0] for t in key_terms[:5]])}" if key_terms else "需要进一步分析的创新点",
+            insights.get("methodology_novelty", "") or "方法论研究",
+        ]
+        
         return {
-            "summary": f"本文提出了{paper.get('title', '')}相关的研究工作。",
-            "innovation_points": ["需要进一步分析的创新点"],
-            "limitations": ["识别出的研究局限性"],
+            "summary": f"本文 '{paper.get('title', '')}' 主要研究了相关领域的问题。共有 {len(parsed_content.get('sections', {}))} 个主要部分，总字数约 {parsed_content.get('word_count', 0)}。",
+            "innovation_points": [p for p in innovation_points if p],
+            "limitations": ["需要与相关工作进行详细对比分析"],
             "future_ideas": ["建议的未来研究方向"],
             "paper_id": paper.get("id"),
             "generated_at": datetime.now().isoformat(),
-            "analysis_method": "default"
+            "analysis_method": "deepened_analysis"
         }
     
     async def _save_analysis_report(self, paper_id: str, report: Dict, user_id: str = None) -> str:
@@ -354,33 +481,75 @@ class MinerAgent(BaseAgent):
             return ""
     
     async def _update_vector_store(self, paper_id: str, paper: Dict, parsed_content: Dict, user_id: str = None):
-        """更新向量库"""
+        """更新向量库 - 利用深度解析结果"""
         try:
             title = paper.get("title", "")
             abstract = paper.get("abstract", "")
             
-            # 组合内容
-            content = f"{title} {abstract}"
+            # 从深度解析中提取关键内容
             sections = parsed_content.get("sections", {})
-            if sections:
-                content += " " + " ".join(sections.values())
+            key_terms = parsed_content.get("key_terms", [])
+            insights = parsed_content.get("insights", {})
+            keywords = parsed_content.get("keywords", [])
             
-            # 添加到L2用户库
+            # 组合多个层次的内容用于向量化
+            content_parts = [
+                title,
+                abstract,
+                ", ".join([t[0] for t in key_terms[:10]]),  # 添加关键词
+                ", ".join(keywords),  # 添加元数据中的关键词
+                insights.get("technical_highlights", "")  # 添加技术亮点
+            ]
+            
+            # 从所有部分提取有用文本
+            for section_name, section_data in sections.items():
+                if isinstance(section_data, dict):
+                    section_content = section_data.get("content", "")
+                    if section_content:
+                        content_parts.append(f"[{section_name}] {section_content[:200]}")
+            
+            content = " ".join([p for p in content_parts if p])
+            
+            # 添加到L2用户库（个人知识库）
             if user_id:
+                # 构建更丰富的元数据
+                metadata = {
+                    "authors": paper.get("authors", []),
+                    "sections_identified": list(sections.keys()),
+                    "word_count": parsed_content.get("word_count", 0),
+                    "page_count": parsed_content.get("page_count", 0),
+                    "key_terms_count": len(key_terms),
+                    "analysis_date": datetime.now().isoformat(),
+                    "parsing_method": parsed_content.get("parsing_method", "unknown"),
+                    "has_insights": bool(insights),
+                    "innovation_indicators": insights.get("innovation_indicators", [])
+                }
+                
                 await vector_store_manager.add_to_l2(
                     user_id=user_id,
                     paper_id=paper_id,
                     title=title,
                     abstract=abstract,
                     content=content,
-                    metadata={
-                        "authors": paper.get("authors", []),
-                        "sections": list(sections.keys()),
-                        "word_count": parsed_content.get("word_count", 0),
-                        "analysis_date": datetime.now().isoformat()
-                    }
+                    metadata=metadata
                 )
-                self._add_to_history(f"论文已添加到用户向量库: {user_id}")
+                
+                self._add_to_history(f"论文已添加到用户向量库（L2）: {user_id}，包含{len(key_terms)}个关键词")
+            
+            # 同时添加到全局库（L1）以便跨用户搜索
+            await vector_store_manager.add_to_l1(
+                paper_id=paper_id,
+                title=title,
+                abstract=abstract,
+                content=content[:2000],  # 限制L1的内容长度
+                metadata={
+                    "authors": paper.get("authors", []),
+                    "sections": list(sections.keys()),
+                    "key_terms": [t[0] for t in key_terms[:5]]
+                }
+            )
+            
+            self._add_to_history(f"论文已同步到全局向量库（L1）")
             
         except Exception as e:
             self._add_to_history(f"更新向量库失败: {str(e)}")
