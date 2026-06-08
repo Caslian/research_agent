@@ -385,6 +385,10 @@
             color: #2e7d32;
         }
 
+        .hidden {
+            display: none;
+        }
+
         .badge-info {
             background: #e3f2fd;
             color: #1976d2;
@@ -1110,28 +1114,21 @@
                 else if (data.papers && Array.isArray(data.papers)) {
                     content += formatPaperResults(data);
                 }
-                // 论文分析结果
-                else if (data.analysis) {
+                // 论文分析结果（analysis 可能为空字符串，用 hasOwnProperty 判断）
+                else if (data.hasOwnProperty('analysis')) {
                     content += formatAnalysisResult(data);
                 }
-                // 写作助手结果
-                else if (data.result && typeof data.result === 'string') {
+                // 写作助手结果（支持字符串或任意结构化对象：polish/explain/suggest/mimic）
+                else if (data.result && (typeof data.result === 'string' || (typeof data.result === 'object' && !Array.isArray(data.result)))) {
                     content += formatWritingResult(data);
                 }
                 // 引用校验结果
                 else if (data.formatted_citation) {
                     content += formatCitationResult(data);
                 }
-                // 其他类型的数据用格式化的 JSON 展示
+                // 兜底：通用结构化数据渲染（不再展示原始 JSON）
                 else {
-                    const jsonStr = JSON.stringify(data, null, 2);
-                    const jsonId = 'json-' + Date.now();
-                    content += `
-                        <div style="position: relative;">
-                            <button class="copy-btn" onclick="copyToClipboard('${jsonId}', event)">📋 复制</button>
-                            <pre id="${jsonId}">${syntaxHighlight(jsonStr)}</pre>
-                        </div>
-                    `;
+                    content += renderGenericResult(data);
                 }
             }
 
@@ -1381,13 +1378,133 @@
                 `;
             }
 
-            const resultId = 'writing-result-' + Date.now();
-            html += '<div class="paper-card">';
-            html += '<h4>✨ 处理结果 <button class="copy-btn" onclick="copyToClipboard(\'' + resultId + '\', event)" style="float: right;">📋 复制</button></h4>';
-            html += '<div class="markdown-content" id="' + resultId + '">';
-            html += renderMarkdown(data.result);
-            html += '</div>';
-            html += '</div>';
+            // 提取要展示的文本：可能是字符串，也可能是结构化对象
+            const resultObj = data.result;
+            const mainTextField = resultObj.polished_text ? 'polished_text'
+                : resultObj.explanation ? 'explanation'
+                : resultObj.rewritten_text ? 'rewritten_text'
+                : resultObj.evaluation ? 'evaluation'
+                : null;
+            const resultText = (typeof resultObj === 'string') ? resultObj
+                : (mainTextField ? resultObj[mainTextField] : '');
+
+            if (resultText) {
+                const resultId = 'writing-result-' + Date.now();
+                html += '<div class="paper-card">';
+                html += '<h4>✨ 处理结果 <button class="copy-btn" onclick="copyToClipboard(\'' + resultId + '\', event)" style="float: right;">📋 复制</button></h4>';
+                html += '<div class="markdown-content" id="' + resultId + '">';
+                html += renderMarkdown(resultText);
+                html += '</div>';
+                html += '</div>';
+            }
+
+            // 如果是结构化对象，展示辅助字段（排除主文本字段）
+            if (typeof resultObj === 'object' && !Array.isArray(resultObj)) {
+                const skipKeys = ['polished_text', 'explanation', 'rewritten_text', 'evaluation'];
+                const fieldLabels = {
+                    modifications: '修改记录', main_modifications: '主要修改',
+                    style_suggestions: '风格建议', style_improvement: '风格改进',
+                    examples: '示例', applications: '应用场景',
+                    importance: '重要性说明',
+                    suggestions: '改进建议', improvement_suggestions: '改进建议',
+                    improvements: '改进点', grammar_issues: '语法问题',
+                    structure_suggestions: '结构建议',
+                    techniques: '技巧', mimic_techniques: '模仿技巧',
+                    style_analysis: '风格分析', references: '参考文献'
+                };
+
+                Object.keys(resultObj).forEach(function(key) {
+                    if (skipKeys.indexOf(key) >= 0) return;
+                    const val = resultObj[key];
+                    const label = fieldLabels[key] || key;
+                    const sectionId = 'sec-' + key + '-' + Date.now();
+
+                    if (Array.isArray(val) && val.length > 0) {
+                        html += '<div class="paper-card" style="margin-top: 10px;">';
+                        html += '<h4 style="cursor: pointer;" onclick="document.getElementById(\'' + sectionId + '\').classList.toggle(\'hidden\')">📋 ' + label + ' (' + val.length + ' 条) ▾</h4>';
+                        html += '<ul id="' + sectionId + '" style="font-size: 13px; color: #555; line-height: 1.8; padding-left: 20px;">';
+                        val.forEach(function(item) {
+                            html += '<li>' + escapeHtml(String(item)) + '</li>';
+                        });
+                        html += '</ul>';
+                        html += '</div>';
+                    } else if (typeof val === 'string' && val.trim()) {
+                        html += '<div class="paper-card" style="margin-top: 10px; border-left: 3px solid #667eea;">';
+                        html += '<h4 style="cursor: pointer; color: #667eea;" onclick="document.getElementById(\'' + sectionId + '\').classList.toggle(\'hidden\')">💡 ' + label + ' ▾</h4>';
+                        html += '<div id="' + sectionId + '" style="font-size: 13px; color: #666; line-height: 1.8;">' + renderMarkdown(val) + '</div>';
+                        html += '</div>';
+                    }
+                });
+            }
+
+            return html;
+        }
+
+        // 通用结构化数据渲染（兜底方案，避免展示原始 JSON）
+        function renderGenericResult(data) {
+            if (!data || typeof data !== 'object') return '';
+
+            const skipKeys = ['agent_task_id', 'success'];
+            const labelMap = {
+                model_info: '模型信息', original: '原文', original_citation: '原始引用',
+                concept: '概念', keywords: '关键词', style: '风格', task: '任务类型',
+                papers: '论文列表', analysis: '分析结果', abstract: '摘要',
+                summary: '摘要', result: '处理结果', metadata: '元数据',
+                all_formats: '全部格式', warnings: '警告', verified: '验证状态',
+                verification_status: '验证状态', format: '格式',
+                formatted_citation: '格式化引用', analysis_type: '分析类型',
+                paper_info: '论文信息', total_found: '搜索结果数',
+                source: '数据源', message: '消息', status: '状态'
+            };
+
+            let html = '<div class="result-header"><span>📋 返回结果</span></div>';
+
+            // 优先展示 model_info
+            if (data.model_info) {
+                const mi = data.model_info;
+                html += `<div style="background: #f0f4ff; padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; font-size: 12px;">
+                    <span style="color: #667eea; font-weight: bold;">🤖</span> 模型: <strong>${mi.llm_model || 'N/A'}</strong>
+                    <span style="color: #999; margin-left: 10px;">(${mi.llm_provider || 'OpenAI'})</span>
+                </div>`;
+            }
+
+            Object.keys(data).forEach(function(key) {
+                if (skipKeys.indexOf(key) >= 0) return;
+                const val = data[key];
+                const label = labelMap[key] || key;
+                const secId = 'gen-' + key + '-' + Date.now();
+
+                if (val === null || val === undefined) return;
+
+                if (Array.isArray(val)) {
+                    html += '<div class="paper-card" style="margin-top: 8px;">';
+                    html += `<h4 style="cursor: pointer;" onclick="document.getElementById('${secId}').classList.toggle('hidden')">📋 ${label} (${val.length} 项) ▾</h4>`;
+                    html += `<div id="${secId}">`;
+                    val.forEach(function(item, i) {
+                        if (typeof item === 'object' && !Array.isArray(item)) {
+                            html += '<div style="margin: 5px 0; padding: 8px; background: #f8f9fa; border-radius: 4px;">';
+                            html += renderGenericResult(item);  // 递归
+                            html += '</div>';
+                        } else {
+                            html += `<div style="padding: 4px 0; font-size: 13px; color: #555;">${i + 1}. ${escapeHtml(String(item))}</div>`;
+                        }
+                    });
+                    html += '</div></div>';
+                } else if (typeof val === 'object') {
+                    html += '<div class="paper-card" style="margin-top: 8px;">';
+                    html += `<h4 style="cursor: pointer;" onclick="document.getElementById('${secId}').classList.toggle('hidden')">📌 ${label} ▾</h4>`;
+                    html += `<div id="${secId}">`;
+                    html += renderGenericResult(val);  // 递归
+                    html += '</div></div>';
+                } else if (typeof val === 'string' && val.length > 0) {
+                    html += '<div class="paper-card" style="margin-top: 8px;">';
+                    html += `<h4>📝 ${label}</h4>`;
+                    html += `<div class="markdown-content">${renderMarkdown(val)}</div>`;
+                    html += '</div>';
+                } else if (typeof val === 'number' || typeof val === 'boolean') {
+                    html += `<div style="padding: 4px 12px; font-size: 13px;"><strong>${label}:</strong> <span style="color: #667eea;">${val}</span></div>`;
+                }
+            });
 
             return html;
         }

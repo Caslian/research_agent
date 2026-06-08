@@ -65,8 +65,8 @@ class LangChainEmbeddings(Embeddings):
         except Exception as e:
             import logging
             logger = logging.getLogger(__name__)
-            logger.error(f"批量嵌入失败: {str(e)}, 使用零向量")
-            return [[0.0] * 1536 for _ in texts]
+            logger.error(f"批量嵌入失败: {str(e)}")
+            raise RuntimeError(f"向量生成失败: {str(e)}") from e
     
     def embed_query(self, text: str) -> List[float]:
         """嵌入查询"""
@@ -86,8 +86,8 @@ class LangChainEmbeddings(Embeddings):
         except Exception as e:
             import logging
             logger = logging.getLogger(__name__)
-            logger.error(f"查询嵌入失败: {str(e)}, 使用零向量")
-            return [0.0] * 1536
+            logger.error(f"查询嵌入失败: {str(e)}")
+            raise RuntimeError(f"向量生成失败: {str(e)}") from e
     
     async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
         """异步批量嵌入文档"""

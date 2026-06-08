@@ -1,14 +1,13 @@
 """
-论文相关API路由
+论文相关API路由 — 委托 HunterAgent 执行搜索
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import logging
-import arxiv
-from datetime import datetime
 from core.config import get_config
+from agents.controller import agent_controller, TaskType
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -81,57 +80,10 @@ def _build_arxiv_query(keywords: str) -> str:
 
 @router.post("/search", response_model=Dict[str, Any])
 async def search_papers(request: PaperSearchRequest):
-    """搜索论文 - 使用真实的 ArXiv API"""
+    """搜索论文 — 委托 HunterAgent 通过 LangGraph ReAct 执行"""
     try:
-        papers = []
-        
-        if request.source == "arxiv" or request.source == "all":
-            # 使用 ArXiv API 搜索
-            logger.info(f"正在搜索 ArXiv: {request.keywords}")
-            
-            # 构建搜索查询（修复：使用 AND 逻辑组合关键词）
-            arxiv_query = _build_arxiv_query(request.keywords)
-            
-            if not arxiv_query:
-                return {
-                    "success": True,
-                    "papers": [],
-                    "total_found": 0,
-                    "keywords": request.keywords,
-                    "source": request.source,
-                    "message": "关键词不能为空"
-                }
-            
-            logger.info(f"ArXiv 查询语句: {arxiv_query}")
-            
-            search = arxiv.Search(
-                query=arxiv_query,
-                max_results=request.limit,
-                # 修复：优先按相关性排序（Relevance），而非最新时间
-                # 最新论文（SubmittedDate）≠ 最相关，用 Relevance 确保关键词匹配度最高的结果排前面
-                sort_by=arxiv.SortCriterion.Relevance,
-                sort_order=arxiv.SortOrder.Descending
-            )
-            
-            # 获取搜索结果
-            for result in search.results():
-                paper = {
-                    "id": result.entry_id.split('/')[-1],
-                    "title": result.title,
-                    "authors": [author.name for author in result.authors],
-                    "abstract": result.summary.replace('\n', ' ').strip(),
-                    "url": result.entry_id,
-                    "published_date": result.published.strftime("%Y-%m-%d"),
-                    "pdf_url": result.pdf_url,
-                    "categories": result.categories,
-                    "primary_category": result.primary_category
-                }
-                papers.append(paper)
-            
-            logger.info(f"找到 {len(papers)} 篇论文")
-        
-        # 如果没有找到结果，返回提示
-        if not papers:
+        keywords = [kw.strip() for kw in request.keywords.split() if kw.strip()]
+        if not keywords:
             return {
                 "success": True,
                 "model_info": _model_info(),
@@ -139,18 +91,47 @@ async def search_papers(request: PaperSearchRequest):
                 "total_found": 0,
                 "keywords": request.keywords,
                 "source": request.source,
-                "message": "未找到相关论文，请尝试其他关键词或缩短关键词"
+                "message": "关键词不能为空"
             }
-        
+
+        sources = ["arxiv"] if request.source in ("arxiv", "all") else [request.source]
+
+        logger.info(f"[Agent] 提交 HunterAgent 搜索任务: keywords={keywords}, sources={sources}")
+        task_id = await agent_controller.submit_task(
+            TaskType.PAPER_HUNTING,
+            {
+                "keywords": keywords,
+                "max_papers": request.limit,
+                "sources": sources,
+            }
+        )
+        result = await agent_controller.execute_task(task_id)
+
+        controller_papers = result.get("papers_found", [])
+        papers = []
+        for p in controller_papers:
+            papers.append({
+                "id": p.get("id", ""),
+                "title": p.get("title", ""),
+                "authors": p.get("authors", []),
+                "abstract": (p.get("abstract", "") or "").replace('\n', ' ').strip(),
+                "url": p.get("pdf_url", "").replace('/pdf/', '/abs/') if p.get("pdf_url") else "",
+                "published_date": p.get("published", ""),
+                "pdf_url": p.get("pdf_url", ""),
+                "categories": p.get("categories", []),
+            })
+
+        stats = result.get("statistics", {})
         return {
             "success": True,
             "model_info": _model_info(),
             "papers": papers,
-            "total_found": len(papers),
+            "total_found": stats.get("total_found", len(papers)),
             "keywords": request.keywords,
-            "source": request.source
+            "source": request.source,
+            "agent_task_id": task_id,
         }
-        
+
     except Exception as e:
         logger.error(f"论文搜索失败: {str(e)}")
         raise HTTPException(status_code=500, detail=f"搜索失败: {str(e)}")

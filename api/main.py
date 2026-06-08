@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import logging
+import sys
 import uvicorn
 
 from core.config import get_config
@@ -15,15 +16,52 @@ from core.vector_store import vector_store_manager
 from agents.controller import agent_controller
 from .routes import papers, users, tasks, analysis, writing, citations, workflow
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
+# 配置日志 — 确保控制台可见
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+LOG_DATE_FORMAT = "%H:%M:%S"
+
+# 根 logger
+logging.basicConfig(
+    level=logging.INFO,
+    format=LOG_FORMAT,
+    datefmt=LOG_DATE_FORMAT,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+# 显式设置各模块的日志级别
+logging.getLogger("api").setLevel(logging.INFO)
+logging.getLogger("agents").setLevel(logging.INFO)
+logging.getLogger("core").setLevel(logging.INFO)
+logging.getLogger("uvicorn").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
+
+def _setup_asyncio_exception_handler():
+    """设置 asyncio 异常处理器，防止未捕获的 Future 异常污染日志"""
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    def handler(_loop, context):
+        exc = context.get("exception")
+        msg = context.get("message", "")
+        # aiohttp 连接关闭是网络层常见事件，降级为 warning
+        if isinstance(exc, Exception) and "connection_lost" in str(exc).lower():
+            logger.warning(f"asyncio 连接关闭: {exc}")
+        else:
+            logger.error(f"asyncio 未处理异常: {msg} | {exc}")
+
+    loop.set_exception_handler(handler)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时初始化
     logger.info("正在启动InnoCore AI...")
+
+    _setup_asyncio_exception_handler()
     
     # 初始化数据库（可选）
     try:

@@ -60,7 +60,7 @@ class CoachAgent(BaseAgent):
                 task_type="explain",
                 prompt_template=self._build_explain_prompt,
                 default_result={
-                    "explanation": "解释生成失败",
+                    "explanation": "Explanation generation failed",
                     "examples": [],
                     "importance": "",
                     "applications": []
@@ -74,7 +74,7 @@ class CoachAgent(BaseAgent):
                 prompt_template=self._build_polish_prompt,
                 default_result={
                     "polished_text": "",
-                    "modifications": ["润色失败: 使用原文"],
+                    "modifications": ["Polish failed: using original text"],
                     "style_suggestions": [],
                     "references": []
                 },
@@ -87,7 +87,7 @@ class CoachAgent(BaseAgent):
                 prompt_template=self._build_mimic_prompt,
                 default_result={
                     "rewritten_text": "",
-                    "style_analysis": "模仿失败: 使用原文",
+                    "style_analysis": "Mimic failed: using original text",
                     "mimic_techniques": [],
                     "reference_structures": []
                 },
@@ -99,7 +99,7 @@ class CoachAgent(BaseAgent):
                 task_type="suggest",
                 prompt_template=self._build_suggest_prompt,
                 default_result={
-                    "overall_evaluation": "分析失败",
+                    "overall_evaluation": "Analysis failed",
                     "improvement_suggestions": [],
                     "grammar_issues": [],
                     "structure_suggestions": [],
@@ -213,10 +213,10 @@ class CoachAgent(BaseAgent):
             default_result = config.default_result.copy()
             # 根据任务类型设置超时消息
             timeout_messages = {
-                "explain": "解释生成超时，请稍后重试",
-                "polish": "润色超时，请稍后重试",
-                "mimic": "模仿超时，请稍后重试",
-                "suggest": "分析超时，请稍后重试"
+                "explain": "Explanation generation timed out, please retry",
+                "polish": "Polish timed out, please retry",
+                "mimic": "Mimic timed out, please retry",
+                "suggest": "Analysis timed out, please retry"
             }
             first_key = next(iter(default_result.keys()))
             default_result[first_key] = timeout_messages.get(config.task_type, "任务超时")
@@ -243,14 +243,24 @@ class CoachAgent(BaseAgent):
         if not response:
             logger.warning("LLM 返回空响应")
             return default_result
-        
-        # 尝试直接解析
+
+        # 阶段1: 尝试直接解析
         try:
             return json.loads(response)
         except json.JSONDecodeError:
             pass
-        
-        # 尝试提取 JSON 代码块
+
+        # 阶段2: 提取 outermost { ... } 块（比代码块 regex 更可靠）
+        start_idx = response.find('{')
+        end_idx = response.rfind('}')
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            json_str = response[start_idx:end_idx + 1]
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                pass
+
+        # 阶段3: 提取 markdown 代码块
         import re
         json_pattern = r'```(?:json)?\s*(.*?)\s*```'
         match = re.search(json_pattern, response, re.DOTALL)
@@ -259,18 +269,11 @@ class CoachAgent(BaseAgent):
                 return json.loads(match.group(1))
             except json.JSONDecodeError:
                 pass
-        
-        # 尝试找到第一个 { 和最后一个 }
-        start_idx = response.find('{')
-        end_idx = response.rfind('}')
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            try:
-                json_str = response[start_idx:end_idx + 1]
-                return json.loads(json_str)
-            except json.JSONDecodeError:
-                pass
-        
-        logger.warning(f"无法解析 LLM JSON 响应，使用默认值。响应前100字符: {response[:100]}")
+
+        logger.warning(
+            f"无法解析 LLM JSON 响应，使用默认值。"
+            f"响应前200字符: {response[:200]}"
+        )
         return default_result
     
     async def _get_cached_user_context(self, user_id: str) -> Dict[str, Any]:
@@ -341,24 +344,24 @@ class CoachAgent(BaseAgent):
         user_context = task_context["user_context"]
         additional_context = task_context["additional_context"]
         
-        return f"""请用通俗易懂的语言解释以下内容：
+        return f"""Explain the following concept in simple, accessible terms. Return ONLY a JSON object (no markdown, no explanation).
 
-需要解释的内容：
+Concept to explain:
 {content}
 
-上下文信息：
+Additional context:
 {json.dumps(additional_context, ensure_ascii=False, indent=2)}
 
-用户研究领域背景：
+User research background:
 {json.dumps(user_context, ensure_ascii=False, indent=2)}
 
-请提供：
-1. 简单易懂的解释
-2. 相关的例子或类比
-3. 在该领域的重要性
-4. 可能的应用场景
+IMPORTANT: Return a JSON object with exactly these keys:
+- "explanation": clear explanation in simple terms
+- "examples": list of concrete examples or analogies
+- "importance": why this matters in the field
+- "applications": list of potential applications
 
-请以JSON格式返回结果，不要包含Markdown代码块标记。"""
+Example: {{"explanation": "This is...", "examples": ["Think of it as..."], "importance": "Critical for...", "applications": ["Used in..."]}}"""
     
     def _build_polish_prompt(self, content: str, task_context: Dict) -> str:
         """构建润色任务的 prompt"""
@@ -366,33 +369,24 @@ class CoachAgent(BaseAgent):
         style_references = task_context["style_references"]
         additional_context = task_context["additional_context"]
         
-        return f"""请将以下文本润色为地道的学术英语：
+        return f"""Polish the following text into academic English. Return ONLY a JSON object (no markdown, no explanation).
 
-原文：
+Original text:
 {content}
 
-用户写作风格偏好：
+User style preferences:
 {json.dumps(user_style, ensure_ascii=False, indent=2)}
 
-风格参考：
-{json.dumps(style_references, ensure_ascii=False, indent=2)}
-
-上下文信息：
+Context:
 {json.dumps(additional_context, ensure_ascii=False, indent=2)}
 
-请提供：
-1. 润色后的英文文本
-2. 主要修改说明
-3. 风格改进建议
-4. 参考的论文句式来源
+IMPORTANT: Return a JSON object with exactly these keys:
+- "polished_text": the polished English academic text
+- "modifications": list of strings describing each change made
+- "style_suggestions": list of style improvement suggestions
+- "references": list of reference sources cited
 
-要求：
-- 保持原意不变
-- 使用地道的学术表达
-- 符合目标期刊/会议的写作风格
-- 在注释中说明参考了哪些历史论文的句式
-
-请以JSON格式返回结果，不要包含Markdown代码块标记。"""
+Example: {{"polished_text": "This study examines...", "modifications": ["Replaced X with Y"], "style_suggestions": ["Use passive voice"], "references": ["Nature 2022"]}}"""
     
     def _build_mimic_prompt(self, content: str, task_context: Dict) -> str:
         """构建模仿任务的 prompt"""
@@ -400,52 +394,52 @@ class CoachAgent(BaseAgent):
         reference_papers = task_context["reference_papers"]
         additional_context = task_context["additional_context"]
         
-        return f"""请基于以下参考论文的写作风格，重写给定内容：
+        return f"""Rewrite the following content in the target writing style. Return ONLY a JSON object (no markdown, no explanation).
 
-原文：
+Original:
 {content}
 
-目标风格：
+Target style:
 {target_style}
 
-参考论文：
+Reference papers:
 {json.dumps(reference_papers, ensure_ascii=False, indent=2)}
 
-上下文信息：
+Context:
 {json.dumps(additional_context, ensure_ascii=False, indent=2)}
 
-请提供：
-1. 重写后的文本
-2. 风格分析（说明如何体现目标风格）
-3. 具体的模仿技巧
-4. 参考的句式结构
+IMPORTANT: Return a JSON object with exactly these keys:
+- "rewritten_text": the text rewritten in the target style
+- "style_analysis": explanation of how the target style was achieved
+- "mimic_techniques": list of specific techniques used
+- "reference_structures": list of sentence structures borrowed from references
 
-请以JSON格式返回结果，不要包含Markdown代码块标记。"""
+Example: {{"rewritten_text": "...", "style_analysis": "...", "mimic_techniques": ["..."], "reference_structures": ["..."]}}"""
     
     def _build_suggest_prompt(self, content: str, task_context: Dict) -> str:
         """构建建议任务的 prompt"""
         user_writing_history = task_context["user_writing_history"]
         additional_context = task_context["additional_context"]
         
-        return f"""请对以下文本提供改进建议：
+        return f"""Review the following text and suggest improvements. Return ONLY a JSON object (no markdown, no explanation).
 
-文本内容：
+Text:
 {content}
 
-用户写作历史：
+User writing history:
 {json.dumps(user_writing_history, ensure_ascii=False, indent=2)}
 
-上下文信息：
+Context:
 {json.dumps(additional_context, ensure_ascii=False, indent=2)}
 
-请提供：
-1. 整体评价
-2. 具体改进建议（按重要性排序）
-3. 语法和表达问题
-4. 结构优化建议
-5. 学术表达改进
+IMPORTANT: Return a JSON object with exactly these keys:
+- "overall_evaluation": brief overall assessment
+- "improvement_suggestions": list of specific improvement suggestions ranked by importance
+- "grammar_issues": list of grammar or expression issues found
+- "structure_suggestions": list of structure optimization suggestions
+- "academic_improvements": list of academic expression improvements
 
-请以JSON格式返回结果，不要包含Markdown代码块标记。"""
+Example: {{"overall_evaluation": "Well written but...", "improvement_suggestions": ["Add more examples..."], "grammar_issues": ["Passive voice overuse..."], "structure_suggestions": ["Reorder section 2..."], "academic_improvements": ["Use more precise terminology..."]}}"""
     
     # ==================== 结果验证器 ====================
     
@@ -479,6 +473,13 @@ class CoachAgent(BaseAgent):
     
     async def _get_user_context(self, user_id: str) -> Dict[str, Any]:
         """获取用户的研究背景"""
+        # 非 UUID 格式的 user_id（如 'default'）不查询数据库
+        import re as _re
+        uuid_pattern = _re.compile(
+            r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+        )
+        if not user_id or not uuid_pattern.match(user_id):
+            return {}
         try:
             user = await db_manager.get_user(user_id)
             if user:

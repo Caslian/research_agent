@@ -117,33 +117,50 @@ class HunterAgent(BaseAgent):
             "sortOrder": "descending"
         }
         
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.arxiv_base_url, params=params) as response:
-                    if response.status != 200:
-                        raise ExternalAPIException(f"ArXiv API请求失败: {response.status}")
-                    
-                    xml_content = await response.text()
-                    feed = feedparser.parse(xml_content)
-                    
-                    for entry in feed.entries:
-                        paper = {
-                            "id": entry.id.split("/")[-1],
-                            "title": entry.title,
-                            "authors": [author.name for author in entry.authors],
-                            "abstract": entry.summary,
-                            "published": entry.published,
-                            "pdf_url": entry.link.replace('/abs/', '/pdf/') + '.pdf',
-                            "source": "arxiv",
-                            "doi": entry.get('arxiv_doi', ''),
-                            "categories": [tag.term for tag in entry.tags]
-                        }
-                        
-                        papers.append(paper)
-                        
-        except Exception as e:
-            self._add_to_history(f"ArXiv搜索失败: {str(e)}")
-        
+        import logging
+        logger = logging.getLogger(__name__)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(self.arxiv_base_url, params=params, ssl=False) as response:
+                        if response.status == 429:
+                            wait = 3 * (attempt + 1)
+                            logger.warning(f"ArXiv 限流 (429)，第 {attempt+1}/{max_retries} 次重试，等待 {wait}s...")
+                            await asyncio.sleep(wait)
+                            continue
+                        if response.status != 200:
+                            raise ExternalAPIException(f"ArXiv API请求失败: {response.status}")
+
+                        xml_content = await response.text()
+                        feed = feedparser.parse(xml_content)
+
+                        for entry in feed.entries:
+                            paper = {
+                                "id": entry.id.split("/")[-1],
+                                "title": entry.title,
+                                "authors": [author.name for author in entry.authors],
+                                "abstract": entry.summary,
+                                "published": entry.published,
+                                "pdf_url": entry.link.replace('/abs/', '/pdf/') + '.pdf',
+                                "source": "arxiv",
+                                "doi": entry.get('arxiv_doi', ''),
+                                "categories": [tag.term for tag in entry.tags]
+                            }
+
+                            papers.append(paper)
+                        break  # 成功，退出重试循环
+
+            except ExternalAPIException:
+                raise
+            except Exception as e:
+                logger.warning(f"ArXiv 请求异常 (尝试 {attempt+1}/{max_retries}): {str(e)}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 * (attempt + 1))
+                else:
+                    logger.error(f"ArXiv search failed after {max_retries} retries: {str(e)}")
+                    self._add_to_history(f"ArXiv search failed: {str(e)}")
+
         return papers
     
     async def _search_papers_from_ieee(self, keywords: List[str], max_papers: int, days_back: int) -> List[Dict]:
@@ -171,7 +188,7 @@ class HunterAgent(BaseAgent):
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(self.ieee_base_url, params=params) as response:
+                async with session.get(self.ieee_base_url, params=params, ssl=False) as response:
                     if response.status != 200:
                         raise ExternalAPIException(f"IEEE API请求失败: {response.status}")
                     
@@ -260,7 +277,7 @@ class HunterAgent(BaseAgent):
             
             # 下载PDF
             async with aiohttp.ClientSession() as session:
-                async with session.get(pdf_url) as response:
+                async with session.get(pdf_url, ssl=False) as response:
                     if response.status == 200:
                         content = await response.read()
                         
@@ -329,7 +346,7 @@ class HunterAgent(BaseAgent):
         """下载PDF工具"""
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(pdf_url) as response:
+                async with session.get(pdf_url, ssl=False) as response:
                     if response.status == 200:
                         content = await response.read()
                         filename = f"download_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"

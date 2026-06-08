@@ -34,36 +34,48 @@ class ValidatorAgent(BaseAgent):
         self.add_tool("scholar_lookup", self._scholar_lookup, "Google Scholar查询")
     
     async def run(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """执行引用校验任务"""
-        await self.validate_input(input_data)
-        
+        """执行引用校验任务
+
+        支持两种输入模式：
+        1. paper_info 模式：{paper_info: {title, authors, ...}, formats?, verify_external?}
+        2. citation_text 模式：{citation_text: "raw citation string", format?}
+        """
         self.set_state("running")
-        
+
         try:
-            paper_info = input_data["paper_info"]
             formats = input_data.get("formats", ["bibtex", "apa", "ieee"])
             verify_external = input_data.get("verify_external", True)
-            
+            paper_info = input_data.get("paper_info")
+
+            # 模式2: citation_text（从引用字符串解析元数据）
+            if "citation_text" in input_data and not paper_info:
+                paper_info = await self._resolve_paper_from_citation(input_data["citation_text"])
+                if not paper_info:
+                    raise AgentException(f"无法从引用中提取元数据: {input_data['citation_text'][:100]}")
+
+            if not paper_info:
+                raise AgentException("必须提供 paper_info 或 citation_text")
+
             # 1. 生成多种格式的引用
             citations = await self._generate_citations(paper_info, formats)
-            
+
             # 2. 外部校验元数据
             verification_result = {}
             if verify_external:
                 verification_result = await self._verify_paper_metadata(paper_info)
-            
+
             # 3. 合并和更新引用信息
             final_citations = await self._merge_citation_data(
-                citations, 
-                verification_result, 
+                citations,
+                verification_result,
                 paper_info
             )
-            
+
             # 4. 缓存结果
             await self._cache_citation_results(final_citations)
-            
+
             self.set_state("completed")
-            
+
             return {
                 "status": "success",
                 "paper_info": paper_info,
@@ -73,14 +85,98 @@ class ValidatorAgent(BaseAgent):
                 "verification_status": verification_result.get("status", "unknown"),
                 "timestamp": datetime.now().isoformat()
             }
-            
+
         except Exception as e:
             self.set_state("error")
             raise AgentException(f"Validator Agent执行失败: {str(e)}")
-    
+
     def get_required_fields(self) -> List[str]:
-        """获取必需的输入字段"""
-        return ["paper_info"]
+        """获取必需的输入字段（灵活校验，run() 内部处理）"""
+        return []
+
+    async def _resolve_paper_from_citation(self, citation_text: str) -> Optional[Dict]:
+        """从引用字符串中解析论文元数据
+
+        策略：ArXiv ID 提取 → DOI 提取 → LLM 解析
+        """
+        # 1. 尝试提取 ArXiv ID
+        arxiv_pattern = r'(?:arxiv\.org/abs/|arXiv:)(\d+\.\d+)'
+        arxiv_match = re.search(arxiv_pattern, citation_text, re.IGNORECASE)
+        if arxiv_match:
+            arxiv_id = arxiv_match.group(1)
+            try:
+                import arxiv
+                search = arxiv.Search(id_list=[arxiv_id])
+                paper = next(search.results(), None)
+                if paper:
+                    return {
+                        "title": paper.title,
+                        "authors": [a.name for a in paper.authors],
+                        "year": paper.published.year,
+                        "journal": "arXiv preprint",
+                        "arxiv_id": arxiv_id,
+                        "url": paper.entry_id,
+                    }
+            except Exception as e:
+                self._add_to_history(f"ArXiv 解析失败: {str(e)}")
+
+        # 2. 尝试提取 DOI
+        doi_pattern = r'10\.\d{4,9}/[-._;()/:A-Z0-9]+'
+        doi_match = re.search(doi_pattern, citation_text, re.IGNORECASE)
+        if doi_match:
+            doi = doi_match.group(0)
+            crossref_data = await self._crossref_lookup_by_doi(doi)
+            if crossref_data:
+                return crossref_data
+
+        # 3. LLM 解析
+        try:
+            metadata = await self._llm_parse_citation(citation_text)
+            if metadata:
+                return metadata
+        except Exception as e:
+            self._add_to_history(f"LLM 解析引用失败: {str(e)}")
+
+        return None
+
+    async def _llm_parse_citation(self, citation_text: str) -> Optional[Dict]:
+        """使用 LLM 从引用文本中提取元数据"""
+        if not self.llm:
+            return None
+
+        prompt = f"""从以下引用信息中提取关键元数据，以 JSON 格式返回。
+
+引用信息：
+{citation_text}
+
+请提取以下信息（如果有的话）：
+- title: 论文标题
+- authors: 作者列表（字符串数组）
+- year: 发表年份（数字）
+- journal: 期刊或会议名称
+- volume: 卷号
+- issue: 期号
+- pages: 页码
+- doi: DOI（如果有）
+- arxiv_id: ArXiv ID（如果有）
+
+只返回纯 JSON 格式，不要任何其他文字说明。"""
+
+        try:
+            llm_instance = self.llm.llm if hasattr(self.llm, 'llm') else self.llm
+            response = await llm_instance.ainvoke(prompt)
+            text = response.content if hasattr(response, 'content') else str(response)
+
+            json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
+            if json_match:
+                return json.loads(json_match.group(1))
+            json_match = re.search(r'\{[\s\S]*\}', text)
+            if json_match:
+                return json.loads(json_match.group(0))
+        except Exception:
+            pass
+
+        return None
     
     async def _generate_citations(self, paper_info: Dict, formats: List[str]) -> Dict[str, Any]:
         """生成多种格式的引用"""

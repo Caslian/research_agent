@@ -31,81 +31,186 @@ class MinerAgent(BaseAgent):
         self.add_tool("generate_report", self._generate_report, "生成分析报告")
     
     async def run(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """执行论文分析和创新点挖掘任务"""
-        await self.validate_input(input_data)
-        
+        """执行论文分析和创新点挖掘任务
+
+        支持两种输入模式：
+        1. paper_id 模式：{paper_id, user_id?, analysis_type?}
+        2. paper_url 模式：{paper_url, analysis_type?}
+        3. paper_text 模式：{title, abstract, full_text?, analysis_type?}
+        """
         self.set_state("running")
-        
+
         try:
-            paper_id = input_data["paper_id"]
             user_id = input_data.get("user_id")
-            analysis_type = input_data.get("analysis_type", "full")  # full, quick, innovation_only
-            
-            # 获取论文信息
-            paper = await db_manager.get_paper(paper_id)
-            if not paper:
-                raise AgentException(f"论文不存在: {paper_id}")
-            
-            self._add_to_history(f"开始分析论文: {paper['title']}")
-            
-            # 1. 解析PDF内容
+            analysis_type = input_data.get("analysis_type", "comprehensive")
+            paper_id = input_data.get("paper_id")
+
+            # 模式1: paper_url（ArXiv URL 或本地 PDF）
+            if "paper_url" in input_data and not paper_id:
+                paper = await self._resolve_paper_from_url(input_data["paper_url"])
+                if not paper:
+                    raise AgentException(f"无法解析论文: {input_data['paper_url']}")
+                paper_id = paper.get("id", "unknown")
+            # 模式2: paper_text（直接传入标题+摘要+正文）
+            elif "title" in input_data and "abstract" in input_data:
+                paper = {
+                    "id": "direct_input",
+                    "title": input_data["title"],
+                    "authors": input_data.get("authors", []),
+                    "abstract": input_data["abstract"],
+                    "file_path": input_data.get("file_path"),
+                }
+                paper_id = "direct_input"
+            # 模式3: paper_id（从数据库获取）
+            elif paper_id:
+                paper = await db_manager.get_paper(paper_id)
+                if not paper:
+                    raise AgentException(f"论文不存在: {paper_id}")
+            else:
+                raise AgentException("必须提供 paper_id、paper_url 或 title+abstract")
+
+            self._add_to_history(f"开始分析论文: {paper.get('title', 'Unknown')[:80]}")
+
+            # 1. 解析论文内容
             parsed_content = await self._parse_paper_content(paper)
-            
+
             # 2. 检索相关历史论文
             related_papers = await self._find_related_papers(
-                paper["title"], 
-                paper["abstract"], 
-                user_id
+                paper.get("title", ""),
+                paper.get("abstract", ""),
+                user_id,
             )
-            
+
             # 3. 进行对比分析
             comparison_result = await self._perform_comparison_analysis(
-                parsed_content, 
-                related_papers
+                parsed_content, related_papers
             )
-            
+
             # 4. 生成分析报告
             report = await self._create_analysis_report(
-                paper, 
-                parsed_content, 
-                related_papers, 
-                comparison_result,
-                user_id
+                paper, parsed_content, related_papers, comparison_result, user_id
             )
-            
-            # 5. 保存报告到数据库
-            report_id = await self._save_analysis_report(paper_id, report, user_id)
-            
+
+            # 5. 保存报告到数据库（如果有真正的 paper_id）
+            report_id = ""
+            if paper_id and paper_id != "direct_input":
+                try:
+                    report_id = await self._save_analysis_report(paper_id, report, user_id)
+                except Exception:
+                    pass
+
             # 6. 更新向量库
-            await self._update_vector_store(paper_id, paper, parsed_content, user_id)
-            
+            if paper_id:
+                try:
+                    await self._update_vector_store(paper_id, paper, parsed_content, user_id)
+                except Exception:
+                    pass
+
             self.set_state("completed")
-            
+
+            # 回退映射：处理 LLM 返回不同大小写 key 的情况
+            _key_map = {
+                "summary": ["summary", "Summary", "SUMMARY"],
+                "innovation_points": ["innovation_points", "Innovation", "innovation", "Innovation Points"],
+                "limitations": ["limitations", "Limitation", "Limitations", "limitation"],
+                "future_ideas": ["future_ideas", "Future Ideas", "future_ideas", "future_work"],
+            }
+            _resolved = {}
+            for canonical, aliases in _key_map.items():
+                for alias in aliases:
+                    if alias in report:
+                        _resolved[canonical] = report[alias]
+                        break
+
             return {
-                "status": "success",
+                "success": True,
                 "paper_id": paper_id,
                 "report_id": report_id,
-                "analysis_type": analysis_type,
-                "parsed_content": {
-                    "sections": list(parsed_content.get("sections", {}).keys()),
-                    "word_count": parsed_content.get("word_count", 0)
+                "paper_info": {
+                    "title": paper.get("title", ""),
+                    "authors": paper.get("authors", []),
                 },
+                "analysis_type": analysis_type,
+                "analysis": _resolved.get("summary", report.get("summary", "")),
+                "innovation_points": _resolved.get("innovation_points", report.get("innovation_points", [])),
+                "limitations": _resolved.get("limitations", report.get("limitations", [])),
+                "future_ideas": _resolved.get("future_ideas", report.get("future_ideas", [])),
                 "related_papers_count": len(related_papers),
-                "report_summary": {
-                    "summary": report.get("summary", "")[:200] + "...",
-                    "innovation_points": len(report.get("innovation_points", [])),
-                    "limitations": len(report.get("limitations", [])),
-                    "future_ideas": len(report.get("future_ideas", []))
-                }
             }
-            
+
+        except AgentException:
+            raise
         except Exception as e:
             self.set_state("error")
             raise AgentException(f"Miner Agent执行失败: {str(e)}")
-    
+
     def get_required_fields(self) -> List[str]:
-        """获取必需的输入字段"""
-        return ["paper_id"]
+        """获取必需的输入字段 — paper_id 或 paper_url 或 title+abstract"""
+        return []  # 改为柔性校验，run() 内部判断
+
+    async def _resolve_paper_from_url(self, paper_url: str) -> Optional[Dict]:
+        """从 ArXiv URL 获取论文元数据"""
+        import re
+        try:
+            import arxiv
+            patterns = [
+                r'arxiv\.org/abs/(\d+\.\d+)',
+                r'arxiv\.org/pdf/(\d+\.\d+)',
+                r'arXiv:(\d+\.\d+)',
+                r'^(\d{4}\.\d{4,5})',
+            ]
+            paper_id = None
+            for p in patterns:
+                m = re.search(p, paper_url, re.IGNORECASE)
+                if m:
+                    paper_id = m.group(1)
+                    break
+            if not paper_id:
+                return None
+
+            search = arxiv.Search(id_list=[paper_id])
+            result = next(search.results(), None)
+            if not result:
+                return None
+
+            paper_data = {
+                "id": paper_id,
+                "title": result.title,
+                "authors": [a.name for a in result.authors],
+                "abstract": result.summary.replace("\n", " ").strip(),
+                "published": result.published.strftime("%Y-%m-%d"),
+                "url": result.entry_id,
+                "pdf_url": result.pdf_url,
+                "categories": result.categories,
+            }
+
+            # 异步保存到 PostgreSQL
+            try:
+                import hashlib
+                content_hash = hashlib.md5(
+                    (result.title + result.summary).encode()
+                ).hexdigest()
+                existing = await db_manager.get_paper_by_hash(content_hash)
+                if not existing:
+                    db_id = await db_manager.create_paper(
+                        title=result.title,
+                        authors=[a.name for a in result.authors],
+                        abstract=result.summary,
+                        doi=getattr(result, "doi", ""),
+                        content_hash=content_hash,
+                    )
+                    paper_data["db_id"] = db_id
+                    self._add_to_history(f"论文已存入数据库: {db_id}")
+            except Exception:
+                pass
+
+            return paper_data
+        except ImportError:
+            self._add_to_history("arxiv 库未安装，无法通过 URL 获取论文")
+            return None
+        except Exception as e:
+            self._add_to_history(f"解析 ArXiv URL 失败: {str(e)}")
+            return None
     
     async def _parse_paper_content(self, paper: Dict) -> Dict[str, Any]:
         """解析论文内容"""
@@ -346,17 +451,14 @@ class MinerAgent(BaseAgent):
         
         **相关研究数量**：{len(related_papers)} 篇
         
-        请生成包含以下部分的详细分析报告（JSON格式）：
-        
-        1. **Summary** - 论文主要贡献、研究方法和关键发现的全面概述
-        2. **Innovation** - 相比相关论文的具体创新点和技术突破
-        3. **Technical Novelty** - 技术方法的创新程度评估
-        4. **Experimental Validation** - 实验设计的完整性和有效性评估
-        5. **Limitation** - 当前研究存在的局限性和改进空间
-        6. **Future Ideas** - 基于分析建议的未来研究方向和扩展工作
-        7. **Impact Potential** - 该研究的潜在应用价值和影响力
-        
-        返回JSON格式，每个字段是字符串或列表。
+        返回一个严格的JSON对象（不要markdown代码块，不要额外解释），必须包含以下小写英文键名：
+
+        - "summary": 字符串，论文主要贡献、研究方法和关键发现的全面概述
+        - "innovation_points": 字符串列表，相比相关论文的具体创新点和技术突破
+        - "limitations": 字符串列表，当前研究存在的局限性和改进空间
+        - "future_ideas": 字符串列表，基于分析建议的未来研究方向和扩展工作
+
+        示例: {{"summary": "This paper proposes...", "innovation_points": ["Novel method for..."], "limitations": ["Limited dataset..."], "future_ideas": ["Extend to..."]}}
         """
         
         try:

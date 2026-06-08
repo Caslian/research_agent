@@ -125,9 +125,16 @@ class AgentController:
 
         task = self.active_tasks[task_id]
 
+        # 防止重复执行：如果任务已在执行或已完成，直接返回
+        if task["status"] != TaskStatus.PENDING:
+            logger.warning(f"任务 {task_id} 已在执行或已完成 (状态: {task['status'].value})，跳过重复执行")
+            if task["status"] == TaskStatus.COMPLETED:
+                return task.get("result", {})
+            raise AgentException(f"任务 {task_id} 已在执行中")
+
         async with self.semaphore:
-            start_time = datetime.now()
             task["status"] = TaskStatus.RUNNING
+            start_time = datetime.now()
             task["started_at"] = start_time
             await self._trigger_event("task_started", task)
 
@@ -239,6 +246,7 @@ class AgentController:
         task["agent_results"]["coach"] = result
         return {
             "task_type": "writing_assistance",
+            # "assistance_result": result['result']['polished_text'],
             "assistance_result": result,
             "user_id": task["input_data"].get("user_id"),
         }
@@ -289,20 +297,34 @@ class AgentController:
             papers = hunting_result.get("papers", [])
 
             # Stage 2: Miner - 并行分析
-            logger.info(f"工作流 Stage 2: 并行分析 {len(papers)} 篇论文")
+            logger.info(f"[Workflow] Stage 2: 并行分析 {len(papers)} 篇论文")
             analysis_tasks = []
-            for paper in papers[:5]:  # 最多分析5篇
+            for paper in papers[:5]:
+                miner_input = None
                 if paper.get("db_id"):
-                    analysis_tasks.append(self.agents["miner"].run({
-                        "paper_id": paper["db_id"],
-                        "user_id": user_id,
-                        "analysis_type": "full",
-                    }))
+                    miner_input = {"paper_id": paper["db_id"], "user_id": user_id, "analysis_type": "full"}
+                elif paper.get("pdf_url"):
+                    miner_input = {"paper_url": paper["pdf_url"], "user_id": user_id, "analysis_type": "full"}
+                elif paper.get("title") and paper.get("abstract"):
+                    miner_input = {
+                        "title": paper["title"], "abstract": paper["abstract"],
+                        "authors": paper.get("authors", []), "user_id": user_id, "analysis_type": "full",
+                    }
+                if miner_input:
+                    logger.info(f"[Workflow] 提交 MinerAgent 分析: %s", paper.get("title", "")[:60])
+                    analysis_tasks.append(self.agents["miner"].run(miner_input))
+                else:
+                    logger.warning(f"[Workflow] 跳过论文（缺少可用的标识符）: %s", paper.get("title", "")[:60])
+
             if analysis_tasks:
                 analyses = await asyncio.gather(*analysis_tasks, return_exceptions=True)
                 for i, analysis in enumerate(analyses):
-                    if not isinstance(analysis, Exception):
+                    if isinstance(analysis, Exception):
+                        logger.warning(f"[Workflow] Miner 分析失败: {str(analysis)}")
+                    else:
                         workflow_result["analysis_reports"].append(analysis)
+            else:
+                logger.warning("[Workflow] Stage 2: 没有论文需要分析（所有论文缺少 db_id/url/title）")
 
             # Stage 3: Validator - 引用生成
             if input_data.get("validate_citations", False):
@@ -350,7 +372,11 @@ class AgentController:
         while True:
             try:
                 priority, task = await self.task_queue.get()
-                asyncio.create_task(self.execute_task(task["id"]))
+                task_id = task["id"]
+                # 跳过已被同步执行器处理完的任务
+                if task_id not in self.active_tasks or self.active_tasks[task_id]["status"] != TaskStatus.PENDING:
+                    continue
+                asyncio.create_task(self.execute_task(task_id))
             except Exception as e:
                 logger.error(f"任务处理器异常: {str(e)}")
                 await asyncio.sleep(1)
