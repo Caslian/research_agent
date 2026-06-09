@@ -7,7 +7,9 @@ import logging
 from typing import Dict, Any, Optional, List
 import re
 import asyncio
-
+import io
+import tempfile
+import os
 # LangChain Document Loaders
 from langchain_community.document_loaders import PyPDFLoader, PDFPlumberLoader
 from langchain_core.documents import Document
@@ -156,23 +158,35 @@ class PDFParser:
     
     def _extract_abstract(self, text: str) -> str:
         """从文本中提取摘要"""
-        # 查找 Abstract 关键词
+        # 先清洗掉 arXiv 头部噪声（ID 行、换行符间隔的元数据等）
+        cleaned = text
+        # 移除 arXiv ID 行 (如 "5202.53851v1" 或 "arXiv:2605.27354v1")
+        cleaned = re.sub(r'^\d{4}\.\d{4,5}(v\d+)?\s*', '', cleaned, count=1)
+        cleaned = re.sub(r'^arXiv:\d{4}\.\d{4,5}(v\d+)?\s*', '', cleaned, count=1)
+
+        # 查找 Abstract 关键词 — 使用更宽泛的分隔边界
         abstract_patterns = [
-            r'Abstract\s*[:\-]?\s*(.*?)(?=\n\n|\nIntroduction|\n1\.|\nKeywords)',
-            r'ABSTRACT\s*[:\-]?\s*(.*?)(?=\n\n|\nINTRODUCTION|\n1\.|\nKEYWORDS)',
-            r'摘要\s*[:\-]?\s*(.*?)(?=\n\n|关键词|引言|1\.)',
+            r'Abstract\s*[:\-]?\s*(.*?)(?=\n\s*(?:1[\.\s]|I[\.\s]|Introduction|Keywords|Index Terms|CCS Concepts))',
+            r'ABSTRACT\s*[:\-]?\s*(.*?)(?=\n\s*(?:1[\.\s]|I[\.\s]|INTRODUCTION|KEYWORDS|INDEX TERMS|CCS CONCEPTS))',
+            r'摘要\s*[:\-]?\s*(.*?)(?=\n\s*(?:1[\.\s]|引言|关键词))',
+            r'Abstract\s*[—:\-]?\s*(.*?)(?=\n\s*\n\s*\n)',  # 通用：三个连续换行
+            r'Abstract\s*[—:\-]?\s*(.*?)(?=\n\s*\n)',      # 两个连续换行（更宽松）
         ]
-        
+
         for pattern in abstract_patterns:
-            match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+            match = re.search(pattern, cleaned, re.IGNORECASE | re.DOTALL)
             if match:
                 abstract = match.group(1).strip()
-                # 限制摘要长度
-                if len(abstract) > 50 and len(abstract) < 2000:
-                    return abstract[:1000]  # 最多返回1000字符
-        
-        # 如果没找到，返回前500个字符作为摘要
-        return text[:500].strip() + "..."
+                if len(abstract) > 50:
+                    return abstract[:1500]
+
+        # 回退：跳过前 300 字符的 header 噪声（arXiv ID、标题、作者行）
+        # 从第 300 字符开始找，取 1500 字符
+        fallback_start = min(300, len(cleaned) // 4)
+        fallback = cleaned[fallback_start:fallback_start + 1500].strip()
+        if len(fallback) > 50:
+            return fallback
+        return cleaned[:1500].strip()
     
     async def parse_pdf_from_bytes(self, pdf_bytes: bytes, filename: str = "document.pdf") -> Dict[str, Any]:
         """
@@ -186,9 +200,7 @@ class PDFParser:
             包含解析结果的字典
         """
         try:
-            import io
-            import tempfile
-            import os
+
             
             logger.info(f"开始解析 PDF 字节流: {filename}")
             
