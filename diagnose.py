@@ -366,17 +366,17 @@ def check_database_tables():
         if not existing:
             print(f"⚠️  数据库中没有表，需要初始化")
             print(f"执行以下命令初始化数据库:")
-            print(f"  python install.py")
+            print(f"  python init_db.py    # 或运行项目内置的初始化脚本")
             return False
-        
+
         print(f"✅ 发现 {len(existing)} 个表:")
         for table in existing:
             print(f"   ✅ {table}")
-        
+
         if missing:
             print(f"\n⚠️  缺少以下表: {', '.join(missing)}")
             print(f"执行以下命令重新初始化:")
-            print(f"  python install.py")
+            print(f"  python init_db.py    # 或运行项目内置的初始化脚本")
             return len(missing) == 0
         
         return True
@@ -605,7 +605,7 @@ def main():
         print("  1. Qdrant 连接问题 → docker run -d -p 6333:6333 qdrant/qdrant")
         print("  2. 数据库连接问题 → 检查 PostgreSQL 是否启动")
         print("  3. 依赖包缺失 → 运行 pip install -r requirements.txt")
-        print("  4. 表不存在 → 运行 python install.py 初始化数据库")
+        print("  4. 表不存在 → 运行 python init_db.py 初始化数据库")
 
 if __name__ == "__main__":
     main()

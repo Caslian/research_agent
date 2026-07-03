@@ -34,10 +34,12 @@ DEBUG=True
 
 ### 1.3 涉及模型的两个地方
 
-| 用途 | 文件 | 默认值 | 说明 |
-|------|------|--------|------|
-| **对话/推理** | `core/config.py` → `LLMConfig` | `gpt-3.5-turbo` | 智能体思考、分析、生成报告 |
-| **向量 Embedding** | `core/config.py` → `VectorDBConfig` | `text-embedding-3-small` | 论文向量化、相似度检索 |
+
+| 用途               | 文件                                  | 默认值                      | 说明            |
+| ---------------- | ----------------------------------- | ------------------------ | ------------- |
+| **对话/推理**        | `core/config.py` → `LLMConfig`      | `gpt-3.5-turbo`          | 智能体思考、分析、生成报告 |
+| **向量 Embedding** | `core/config.py` → `VectorDBConfig` | `text-embedding-3-small` | 论文向量化、相似度检索   |
+
 
 > ⚠️ **注意**：两个地方都需要修改，否则 Embedding 部分仍会调用 OpenAI。
 
@@ -47,31 +49,37 @@ DEBUG=True
 
 ### 2.1 为什么选 ModelScope？
 
-| 对比项 | OpenAI | ModelScope API |
-|--------|--------|----------------|
-| **费用** | 按 token 计费 | **免费额度（每天限量）** |
-| **网络** | 需要科学上网 | 国内直连 ✅ |
-| **注册** | 需要境外手机号 | 国内手机号即可 ✅ |
-| **模型质量** | GPT-3.5/4 | Qwen2.5 系列（效果接近） |
-| **接口格式** | OpenAI 标准 | **兼容 OpenAI 格式** ✅ |
+
+| 对比项      | OpenAI     | ModelScope API     |
+| -------- | ---------- | ------------------ |
+| **费用**   | 按 token 计费 | **免费额度（每天限量）**     |
+| **网络**   | 需要科学上网     | 国内直连 ✅             |
+| **注册**   | 需要境外手机号    | 国内手机号即可 ✅          |
+| **模型质量** | GPT-3.5/4  | Qwen2.5 系列（效果接近）   |
+| **接口格式** | OpenAI 标准  | **兼容 OpenAI 格式** ✅ |
+
 
 ### 2.2 ModelScope 推荐免费模型
 
-| 模型名称 | 参数量 | 特点 | 推荐场景 |
-|---------|--------|------|---------|
-| `Qwen/Qwen2.5-7B-Instruct` | 7B | 均衡，免费 | **首选，日常使用** |
-| `Qwen/Qwen2.5-14B-Instruct` | 14B | 更强，免费 | 复杂分析任务 |
-| `Qwen/Qwen2.5-72B-Instruct` | 72B | 最强，有限免费 | 高质量报告生成 |
-| `deepseek-ai/DeepSeek-V2-Chat` | - | 推理强 | 论文逻辑分析 |
-| `ZhipuAI/glm-4-9b-chat` | 9B | 中文好 | 中文论文处理 |
+
+| 模型名称                           | 参数量 | 特点      | 推荐场景        |
+| ------------------------------ | --- | ------- | ----------- |
+| `Qwen/Qwen2.5-7B-Instruct`     | 7B  | 均衡，免费   | **首选，日常使用** |
+| `Qwen/Qwen2.5-14B-Instruct`    | 14B | 更强，免费   | 复杂分析任务      |
+| `Qwen/Qwen2.5-72B-Instruct`    | 72B | 最强，有限免费 | 高质量报告生成     |
+| `deepseek-ai/DeepSeek-V2-Chat` | -   | 推理强     | 论文逻辑分析      |
+| `ZhipuAI/glm-4-9b-chat`        | 9B  | 中文好     | 中文论文处理      |
+
 
 **Embedding 模型（替代 text-embedding-3-small）：**
 
-| 模型名称 | 维度 | 特点 |
-|---------|------|------|
-| `iic/nlp_gte_sentence-embedding_chinese-large` | 1024 | 中文语义好 |
-| `Alibaba-NLP/gte-Qwen2-1.5B-instruct` | 1536 | 维度兼容 OpenAI |
-| `BAAI/bge-large-zh-v1.5` | 1024 | 中文 SOTA |
+
+| 模型名称                                           | 维度   | 特点          |
+| ---------------------------------------------- | ---- | ----------- |
+| `iic/nlp_gte_sentence-embedding_chinese-large` | 1024 | 中文语义好       |
+| `Alibaba-NLP/gte-Qwen2-1.5B-instruct`          | 1536 | 维度兼容 OpenAI |
+| `BAAI/bge-large-zh-v1.5`                       | 1024 | 中文 SOTA     |
+
 
 ---
 
@@ -206,6 +214,7 @@ python run.py
 ```
 
 启动成功后，日志中应该看到：
+
 ```
 INFO: HelloAgent LLM 初始化成功: Qwen/Qwen2.5-7B-Instruct
 ```
@@ -228,25 +237,31 @@ INFO: HelloAgent LLM 初始化成功: Qwen/Qwen2.5-7B-Instruct
 
 ### 5.1 `.env` 文件修改对照
 
-| 配置项 | 修改前（OpenAI） | 修改后（ModelScope） |
-|--------|----------------|-------------------|
-| `OPENAI_API_KEY` | `sk-proj-xxxxxxxx` | `your_modelscope_token` |
-| `OPENAI_BASE_URL` | *(未设置，默认 OpenAI)* | `https://api-inference.modelscope.cn/v1` |
-| `LLM_MODEL` | *(未设置，默认 gpt-3.5-turbo)* | `Qwen/Qwen2.5-7B-Instruct` |
-| `EMBEDDING_MODEL` | *(未设置，默认 text-embedding-3-small)* | `Alibaba-NLP/gte-Qwen2-1.5B-instruct` |
+
+| 配置项               | 修改前（OpenAI）                       | 修改后（ModelScope）                          |
+| ----------------- | --------------------------------- | ---------------------------------------- |
+| `OPENAI_API_KEY`  | `sk-proj-xxxxxxxx`                | `your_modelscope_token`                  |
+| `OPENAI_BASE_URL` | *(未设置，默认 OpenAI)*                 | `https://api-inference.modelscope.cn/v1` |
+| `LLM_MODEL`       | *(未设置，默认 gpt-3.5-turbo)*          | `Qwen/Qwen2.5-7B-Instruct`               |
+| `EMBEDDING_MODEL` | *(未设置，默认 text-embedding-3-small)* | `Alibaba-NLP/gte-Qwen2-1.5B-instruct`    |
+
 
 ### 5.2 `core/config.py` 修改对照
 
-| 位置 | 修改内容 |
-|------|---------|
-| `VectorDBConfig` 类 | 新增 `embedding_base_url: Optional[str] = None` 字段 |
+
+| 位置                 | 修改内容                                               |
+| ------------------ | -------------------------------------------------- |
+| `VectorDBConfig` 类 | 新增 `embedding_base_url: Optional[str] = None` 字段   |
 | `__post_init__` 方法 | 新增读取 `EMBEDDING_MODEL` 和 `EMBEDDING_BASE_URL` 环境变量 |
+
 
 ### 5.3 `utils/embedding.py` 修改对照
 
-| 位置 | 修改内容 |
-|------|---------|
+
+| 位置              | 修改内容                                                 |
+| --------------- | ---------------------------------------------------- |
 | `initialize` 方法 | 支持从 `vector_db.embedding_base_url` 读取 Embedding 服务地址 |
+
 
 ---
 
@@ -390,6 +405,8 @@ ModelScope 的 Embedding 服务同样兼容 OpenAI 格式，只需修改 `base_u
 ---
 
 > 💡 **最终建议**：
+>
 > - **快速体验**：用 ModelScope 方案，5 分钟搞定
 > - **长期使用**：用 DashScope 方案，稳定且中文效果最好
 > - **面试展示**：重点讲"兼容 OpenAI 接口的多 Provider 设计"，这是亮点
+

@@ -14,6 +14,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import Tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 
 from core.config import get_config
 from core.exceptions import AgentException, TimeoutException
@@ -129,10 +130,10 @@ class BaseAgent(ABC):
             llm = self.llm.llm if hasattr(self.llm, 'llm') else self.llm
             prompt = system_prompt or self._get_system_prompt()
 
-            self.agent_graph = create_react_agent(
+            self.agent_graph = create_agent(
                 model=llm,
                 tools=self.tools,
-                prompt=prompt,
+                system_prompt=prompt,
                 checkpointer=self.checkpointer,
             )
             logger.info(f"Agent {self.name} LangGraph ReAct Agent 构建成功 (工具数: {len(self.tools)})")
