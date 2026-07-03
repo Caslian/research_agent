@@ -120,8 +120,15 @@ class EmbeddingService:
 
     async def _init_openai(self):
         """初始化远程 OpenAI-compatible API"""
-        embedding_api_key = self.config.vector_db.api_key or self.config.llm.api_key
-        embedding_base_url = getattr(self.config.vector_db, 'embedding_base_url', None)
+        # 优先使用 Embedding 专用 key，与 Qdrant key 独立
+        embedding_api_key = (
+            self.config.vector_db.embedding_api_key
+            or self.config.llm.api_key
+        )
+        embedding_base_url = (
+            self.config.vector_db.embedding_base_url
+            or getattr(self.config.llm, 'base_url', None)
+        )
 
         if not embedding_api_key:
             raise AgentException(
@@ -130,24 +137,29 @@ class EmbeddingService:
                 "或设置 EMBEDDING_PROVIDER=local 使用本地模型。"
             )
 
-        api_key_source = "EMBEDDING_API_KEY" if self.config.vector_db.api_key else "OPENAI_API_KEY"
-        logger.info(f"Embedding 服务: OPENAI 模式")
+        api_key_source = (
+            "EMBEDDING_API_KEY" if self.config.vector_db.embedding_api_key
+            else "OPENAI_API_KEY"
+        )
+        logger.info(f"Embedding 服务: {self.provider.upper()} 模式")
         logger.info(f"  - 模型: {self.embedding_model}")
-        logger.info(f"  - Base URL: {embedding_base_url or self.config.llm.base_url}")
+        logger.info(f"  - Base URL: {embedding_base_url or '未配置'}")
         logger.info(f"  - API Key 来源: {api_key_source}")
         logger.info(f"  - API Key 前缀: {embedding_api_key[:10] if embedding_api_key else 'None'}...")
 
         init_kwargs = {
             "model": self.embedding_model,
             "api_key": embedding_api_key,
+            # 关键：DashScope 走 OpenAI-compatible 接口，但只接受 str/list[str]，
+            # 不接受 LangChain 默认 tiktoken 预编码后的 token id 数组。
+            # 关闭长度检查后，LangChain 会把原始字符串直接发出去。
+            "check_embedding_ctx_length": False,
         }
 
         if embedding_base_url:
             init_kwargs["base_url"] = embedding_base_url
-        elif self.config.llm.base_url:
-            init_kwargs["base_url"] = self.config.llm.base_url
 
-        logger.debug(f"OpenAIEmbeddings 初始化参数: {init_kwargs}")
+        logger.debug(f"OpenAIEmbeddings 初始化参数: init_kwargs={init_kwargs}")
         self.embeddings = OpenAIEmbeddings(**init_kwargs)
         logger.info("Embedding 服务初始化成功")
     

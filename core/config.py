@@ -41,13 +41,25 @@ class LLMConfig:
 class VectorDBConfig:
     """向量数据库配置"""
     db_type: VectorDBType = VectorDBType.QDRANT
+    # 远程模式：Qdrant Cloud 等远程地址（如 https://xxxx-xxxx-xxxx-xxxx.us-east-1-0.aws.cloud.qdrant.io:6333）
+    url: Optional[str] = None
+    # 本地模式：host + port
     host: str = "localhost"
     port: int = 6333
     api_key: Optional[str] = None
     collection_name_prefix: str = "innocore"
     embedding_model: str = "text-embedding-3-small"
     embedding_base_url: Optional[str] = None
-    embedding_provider: str = "openai"  # "openai" | "local"
+    embedding_provider: str = "openai"  # "openai" | "dashscope" | "local"
+    embedding_api_key: Optional[str] = None  # Embedding 专用 API Key（与 Qdrant key 独立）
+
+    def get_qdrant_url(self) -> Optional[str]:
+        """返回完整的 Qdrant 连接 URL（远程优先，本地兜底）"""
+        if self.url:
+            return self.url
+        # 本地模式：自动拼接
+        scheme = "https" if self.port == 6334 else "http"
+        return f"{scheme}://{self.host}:{self.port}"
 
 @dataclass
 class DatabaseConfig:
@@ -130,18 +142,27 @@ class InnoCoreConfig:
         if env_model:
             self.llm.model_name = env_model
         
-        # ✅ 新增：读取 Embedding 配置
-        embedding_model = os.getenv("EMBEDDING_MODEL")
-        if embedding_model:
-            self.vector_db.embedding_model = embedding_model
-        
-        embedding_base_url = os.getenv("EMBEDDING_BASE_URL")
-        if embedding_base_url:
-            self.vector_db.embedding_base_url = embedding_base_url
-        embedding_provider = os.getenv("EMBEDDING_PROVIDER")
-        if embedding_provider:
-            self.vector_db.embedding_provider = embedding_provider
-        self.vector_db.api_key = os.getenv("EMBEDDING_API_KEY") or self.vector_db.api_key
+        # Embedding 配置
+        embed_model_type = os.getenv("EMBEDDING_PROVIDER")
+        if embed_model_type:
+            self.vector_db.embedding_provider = embed_model_type
+
+        embed_model_name = os.getenv("EMBEDDING_MODEL")
+        if embed_model_name:
+            self.vector_db.embedding_model = embed_model_name
+
+        embed_base_url = os.getenv("EMBEDDING_BASE_URL")
+        if embed_base_url:
+            self.vector_db.embedding_base_url = embed_base_url
+
+        embed_api_key = os.getenv("EMBEDDING_API_KEY")
+        if embed_api_key:
+            self.vector_db.embedding_api_key = embed_api_key
+        # Qdrant 向量数据库配置（支持远程 URL 或本地 host+port）
+        self.vector_db.url = os.getenv("QDRANT_URL") or self.vector_db.url
+        self.vector_db.host = os.getenv("QDRANT_HOST") or self.vector_db.host
+        self.vector_db.port = int(os.getenv("QDRANT_PORT", str(self.vector_db.port)))
+        self.vector_db.api_key = os.getenv("QDRANT_API_KEY") or self.vector_db.api_key
         self.database.password = self.database.password or os.getenv("DATABASE_PASSWORD")
         self.redis.password = self.redis.password or os.getenv("REDIS_PASSWORD")
         

@@ -4,6 +4,7 @@ LLM 适配器 - 基于 LangChain 框架
 """
 
 import logging
+import os
 from typing import Dict, Any, Optional, List
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -25,13 +26,25 @@ class LLMAdapter:
     def _initialize_llm(self):
         """初始化 LangChain LLM"""
         try:
+            # 优先校验 API Key 是否存在，避免把 None 传给 OpenAI SDK 产生不友好异常
+            api_key = self.config.llm.api_key or os.getenv("OPENAI_API_KEY")
+            base_url = self.config.llm.base_url or os.getenv("OPENAI_BASE_URL")
+            if not api_key:
+                raise RuntimeError(
+                    "未检测到 LLM API Key。\n"
+                    "请在项目根目录创建 .env 文件（可参考 .env.example），并配置以下任一变量：\n"
+                    "  - OPENAI_API_KEY（推荐）\n"
+                    "  - 或 LLM_API_KEY / DASHSCOPE_API_KEY\n"
+                    "并确保对应的 OPENAI_BASE_URL / LLM_BASE_URL 已设置。"
+                )
+
             # LangChain OpenAI 兼容客户端
             # 支持 base_url 参数，可直连任何 OpenAI 兼容端点
             # 包括：ModelScope API / DashScope / SiliconFlow / 自建 vLLM 等
             self.llm = ChatOpenAI(
                 model=self.config.llm.model_name,
-                api_key=self.config.llm.api_key,
-                base_url=self.config.llm.base_url,
+                api_key=api_key,
+                base_url=base_url,
                 temperature=self.config.llm.temperature,
                 max_tokens=self.config.llm.max_tokens,
                 timeout=self.config.llm.timeout,
@@ -39,7 +52,7 @@ class LLMAdapter:
             )
             logger.info(
                 f"LLM 初始化成功: {self.config.llm.model_name} "
-                f"(base_url={self.config.llm.base_url or 'OpenAI 默认'})"
+                f"(base_url={base_url or 'OpenAI 默认'})"
             )
         except ImportError as e:
             logger.error(f"langchain-openai 未安装: {str(e)}")

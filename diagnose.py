@@ -395,114 +395,81 @@ def check_qdrant_connection():
         from core.config import get_config
         from qdrant_client import QdrantClient
         from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
-        from core.vector_store import vector_store_manager
         config = get_config().vector_db
         
-        # 显示 Qdrant 配置
+        # 显示 Qdrant 配置（支持远程 URL 和本地 host+port 两种模式）
+        qdrant_url = config.get_qdrant_url()
         print(f"Qdrant 配置:")
-        print(f"  - 主机: {config.host}")
-        print(f"  - 端口: {config.port}")
-        # print(f"  - 超时: {config.timeout}s")
+        print(f"  - 连接地址: {qdrant_url}")
+        if config.api_key:
+            print(f"  - API Key: 已配置")
         
         print(f"\n正在连接到 Qdrant...")
         
         try:
-            vector_store_manager.initialize()
-            # # 创建客户端连接
-            # client = QdrantClient(
-            #     host=config.host,
-            #     port=config.port,
-            #     timeout=config.timeout
-            # )
+            # 初始化 Qdrant 客户端
+            client = QdrantClient(
+                url=qdrant_url,
+                api_key=config.api_key,
+                prefer_grpc=False,
+                https=qdrant_url.startswith("https://"),
+                check_compatibility=False
+            )
             
-            # # 测试连接 - 获取服务器信息
-            # collection_response = client.get_collections()
-            # collections = [c.name for c in collection_response.collections] if collection_response.collections else []
+            # 测试连接 - 获取服务器信息
+            collection_response = client.get_collections()
+            collections = [c.name for c in collection_response.collections] if collection_response.collections else []
             
-            # print(f"✅ Qdrant 连接成功")
+            print(f"✅ Qdrant 连接成功")
             
-            # # 检查集合
-            # expected_collections = ['L1_collection', 'L2_collection']
-            # missing_collections = [c for c in expected_collections if c not in collections]
-            
-            # if collections:
-            #     print(f"\n✅ 发现 {len(collections)} 个 Collection:")
-            #     for col in collections:
-            #         print(f"   - {col}")
-            # else:
-            #     print(f"\n⚠️  暂无 Collection，将在首次使用时创建")
-            
-            # if missing_collections:
-            #     print(f"\n⚠️  缺少以下 Collection:")
-            #     for col in missing_collections:
-            #         print(f"   - {col}（将在首次使用时自动创建）")
-            
-            # # 检查向量维度配置
-            # print(f"\n向量配置:")
-            # print(f"  - 向量维度: 1536 (OpenAI embedding)")
-            # print(f"  - L1 Collection: 预设集合（系统级）")
-            # print(f"  - L2 Collection: 用户集合（用户级）")
+            # 检查集合
+            if collections:
+                print(f"\n  发现 {len(collections)} 个 Collection:")
+                for col in collections:
+                    print(f"   - {col}")
+            else:
+                print(f"\n  暂无 Collection，将在首次使用时创建")
             
             return True
         
         except TimeoutError:
-            return False, f"连接超时（{config.timeout}s）。请检查：\n" \
+            return False, f"连接超时。请检查：\n" \
                    f"  1. Qdrant 服务是否正在运行\n" \
-                   f"  2. 主机地址是否正确: {config.host}\n" \
-                   f"  3. 端口号是否正确: {config.port}\n" \
-                   f"  4. 网络连接是否正常\n" \
-                   f"  5. 防火墙是否阻止了连接\n\n" \
-                   f"  启动 Qdrant:\n" \
-                   f"    - Docker: docker run -d -p 6333:6333 qdrant/qdrant\n" \
-                   f"    - 本地: qdrant (需要先安装)"
+                   f"  2. 连接地址是否正确: {qdrant_url}\n" \
+                   f"  3. 网络连接是否正常\n" \
+                   f"  4. 防火墙是否阻止了连接\n\n" \
+                   f"  启动 Qdrant（本地 Docker）:\n" \
+                   f"    docker run -d -p 6333:6333 qdrant/qdrant"
         
         except ConnectionRefusedError:
             return False, f"连接被拒绝。请检查：\n" \
                    f"  1. Qdrant 服务是否在运行\n" \
-                   f"  2. 正在监听 {config.host}:{config.port}\n" \
-                   f"  3. 防火墙配置\n\n" \
-                   f"  启动 Qdrant:\n" \
-                   f"    - Docker: docker run -d -p 6333:6333 qdrant/qdrant\n" \
-                   f"    - Linux/macOS: qdrant\n" \
-                   f"    - Windows: qdrant.exe"
+                   f"  2. 连接地址: {qdrant_url}\n" \
+                   f"  3. 防火墙配置"
         
-        except (ResponseHandlingException, UnexpectedResponse, Exception) as e:
+        except (ResponseHandlingException, UnexpectedResponse) as e:
             error_msg = str(e).lower()
             
+            if 'unauthorized' in error_msg or '401' in error_msg or 'api.key' in error_msg:
+                return False, f"API Key 无效或缺失。请检查 .env 中的 QDRANT_API_KEY"
+            
             if 'connection refused' in error_msg or 'refused' in error_msg:
-                return False, f"连接被拒绝: {config.host}:{config.port}\n" \
-                       f"  请检查 Qdrant 服务是否启动\n\n" \
-                       f"  启动命令:\n" \
-                       f"    - Docker: docker run -d -p 6333:6333 qdrant/qdrant\n" \
-                       f"    - 本地: qdrant"
+                return False, f"连接被拒绝: {qdrant_url}\n" \
+                       f"  请检查 Qdrant 服务是否启动"
             
             elif 'connection reset' in error_msg:
-                return False, f"连接被重置。请检查：\n" \
-                       f"  1. Qdrant 服务是否崩溃\n" \
-                       f"  2. 网络连接是否稳定\n" \
-                       f"  3. 防火墙规则"
+                return False, f"连接被重置。请检查网络连接和防火墙规则"
             
             elif 'name or service not known' in error_msg or 'nodename nor servname provided' in error_msg:
-                return False, f"无法解析主机名: {config.host}\n" \
-                       f"  请检查：\n" \
-                       f"  1. 主机名是否拼写正确\n" \
-                       f"  2. 如果是 Docker 容器名，容器是否正在运行\n" \
-                       f"  3. DNS 是否正常工作\n\n" \
-                       f"  Docker 容器查询:\n" \
-                       f"    docker ps | grep qdrant"
+                return False, f"无法解析主机名。请检查连接地址是否正确: {qdrant_url}"
             
             elif 'network is unreachable' in error_msg:
-                return False, f"网络无法到达: {config.host}:{config.port}\n" \
-                       f"  请检查：\n" \
-                       f"  1. 网络连接\n" \
-                       f"  2. Qdrant 主机是否在线\n" \
-                       f"  3. VPN 或代理配置"
+                return False, f"网络无法到达: {qdrant_url}\n" \
+                       f"  请检查网络连接、VPN 或代理配置"
             
             else:
                 return False, f"连接异常: {str(e)}\n\n" \
-                       f"  尝试步骤：\n" \
-                       f"  1. 启动 Qdrant: docker run -d -p 6333:6333 qdrant/qdrant\n" \
-                       f"  2. 验证配置: cat .env | grep QDRANT"
+                       f"  当前配置: {qdrant_url}"
     
     except ImportError as e:
         return False, f"缺少依赖包: qdrant-client\n" \

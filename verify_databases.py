@@ -453,9 +453,15 @@ async def verify_qdrant_and_embedding():
     cfg = get_config().vector_db
 
     # ── 3.1 Qdrant 连接测试 ──
-    step(f"3.1 Qdrant 连接测试 (host={cfg.host}, port={cfg.port})")
+    step(f"3.1 Qdrant 连接测试 ({cfg.get_qdrant_url()})")
     try:
-        client = QdrantClient(host=cfg.host, port=cfg.port, prefer_grpc=False, https=False)
+        client = QdrantClient(
+            url=cfg.get_qdrant_url(),
+            api_key=cfg.api_key,
+            prefer_grpc=False,
+            https=cfg.get_qdrant_url().startswith("https://"),
+            check_compatibility=False
+        )
         collections = client.get_collections()
         col_names = [c.name for c in collections.collections] if collections.collections else []
         ok(f"已连接 — 现有 collections: {col_names if col_names else '(空)'}")
@@ -657,7 +663,13 @@ async def verify_rag_e2e():
             host=cfg_pg.host, port=cfg_pg.port,
             database=cfg_pg.database, user=cfg_pg.username, password=cfg_pg.password,
         )
-        qd_client = QdrantClient(host=cfg_qd.host, port=cfg_qd.port, prefer_grpc=False, https=False)
+        qd_client = QdrantClient(
+            url=cfg_qd.get_qdrant_url(),
+            api_key=cfg_qd.api_key,
+            prefer_grpc=False,
+            https=cfg_qd.get_qdrant_url().startswith("https://"),
+            check_compatibility=False
+        )
 
         from utils.embedding import get_embedding_service
         emb_svc = get_embedding_service()
@@ -917,7 +929,13 @@ async def cleanup_all():
     print("  清理 Qdrant 测试 Collection...")
     try:
         cfg_qd = get_config().vector_db
-        client = QdrantClient(host=cfg_qd.host, port=cfg_qd.port, prefer_grpc=False, https=False)
+        client = QdrantClient(
+            url=cfg_qd.get_qdrant_url(),
+            api_key=cfg_qd.api_key,
+            prefer_grpc=False,
+            https=cfg_qd.get_qdrant_url().startswith("https://"),
+            check_compatibility=False
+        )
         for col_name in ["__verify_test_collection__", "__verify_rag_test__"]:
             try:
                 client.delete_collection(col_name)
