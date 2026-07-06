@@ -23,9 +23,37 @@ from qdrant_client.http.models import CollectionInfo
 
 import hashlib
 import json
+import re
 
 from .config import get_config
 from .exceptions import VectorStoreException
+
+
+# ============================================================
+# Vector store 模块内辅助函数（不依赖 Embedding 抽象）
+# ============================================================
+
+def _normalize(v):
+    """对向量做 L2 归一化，让余弦距离退化为点积。
+    输入是 list[float]，返回 list[float]（同长度）。
+    """
+    import math
+    if not v:
+        return v
+    s = math.sqrt(sum(float(x) * float(x) for x in v))
+    if s <= 0:
+        return v
+    return [float(x) / s for x in v]
+
+
+_WS_RE = re.compile(r"\s+")
+
+
+def preprocess_chunk_text_for_qdrant(text: str) -> str:
+    """Qdrant 入库前最终清理：合并多余空白（与 embedding 端的预处理一致）。"""
+    if not text:
+        return ""
+    return _WS_RE.sub(" ", text).strip()
 
 
 class LangChainEmbeddings(Embeddings):
@@ -693,7 +721,247 @@ class VectorStoreManager:
         """关闭向量数据库连接"""
         if self.client:
             self.client.close()
-    
+
+    # ============================================================
+    # Knowledge Base (KB) 接口 - ChunkProcessor 集成层
+    # 阶段：MVP。payload 平铺在顶层，与旧 LangChain 路径完全独立。
+    # ============================================================
+
+    KB_L1_PRESET = "l1_preset"   # 全局预置库的特殊 kb_id
+
+    def _chunk_point_id(self, paper_id: str, section_name: str, chunk_index: int) -> str:
+        """chunk 点 ID。同一篇论文同一 chunk 多次入库幂等。
+
+        Qdrant 要求点 ID 为 unsigned int 或 UUID。这里直接用 UUID（来自 md5 哈希），
+        避免大整数越界（int32 上限）的兼容问题，也确保 global uniqueness。
+        """
+        import uuid as _uuid
+        h = hashlib.md5(f"{paper_id}|{section_name}|{chunk_index}".encode()).hexdigest()
+        # md5 长度 32，按 UUID 5 格式切片重整（保留幂等性）
+        return str(_uuid.UUID(h))
+
+    def _ensure_payload_indexes(self, collection_name: str, fields: List[str]) -> None:
+        """对 KB 类 collection 追加 payload index（仅 keyword 字段）。"""
+        for f in fields:
+            try:
+                self.client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=f,
+                    field_schema="keyword",
+                )
+            except Exception as e:
+                if "already exists" in str(e).lower():
+                    continue
+                logger.warning(f"为 {collection_name}.{f} 建索引失败: {e}")
+
+    async def add_paper_chunks_kb(
+        self,
+        kb_id: str,
+        user_id: str,
+        paper_id: str,
+        chunks: List[Document],
+        paper_meta: Optional[Dict] = None,
+    ) -> List[str]:
+        """把一篇论文分块后批量写入 L2 用户库（强制加 kb_id / user_id）。
+
+        Args:
+            kb_id:    知识库 ID（用户私有边界）
+            user_id:  用户 ID
+            paper_id: 论文 ID
+            chunks:   来自 utils.chunk_processor.process_paper_to_chunks
+            paper_meta: 论文级 metadata（title / authors / year / venue 等）
+
+        Returns:
+            写入的点 ID 列表（与 chunks 一一对应）
+        """
+        if not kb_id:
+            raise VectorStoreException("kb_id 不能为空")
+        if not chunks:
+            return []
+        try:
+            paper_meta = paper_meta or {}
+
+            # 1. 计算 embedding（一次性 embed_query + batch embed_documents）
+            texts = [preprocess_chunk_text_for_qdrant(c.page_content) for c in chunks]
+            vectors = await self._embed_texts(texts)
+
+            # 2. 构造 PointStruct
+            points = []
+            ids = []
+            for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
+                meta = dict(chunk.metadata or {})
+                # 强制 payload 字段
+                meta.update({
+                    "kb_id": kb_id,
+                    "user_id": user_id,
+                    "paper_id": paper_id,
+                    "title": paper_meta.get("title") or meta.get("paper_title", ""),
+                    "authors": paper_meta.get("authors", []) or [],
+                    "venue": paper_meta.get("venue", ""),
+                    "published_year": int(paper_meta.get("published_year", 0) or 0),
+                    "source_db": "l2_user",
+                    "collection_type": "l2",
+                    "section_name": meta.get("section_name", "unknown"),
+                    "section_type": meta.get("section_type", "body"),
+                    "chunk_index": int(meta.get("chunk_index", i)),
+                    "chunk_token_count": int(meta.get("chunk_token_count", 0) or 0),
+                    "content": chunk.page_content,
+                    "page_content": chunk.page_content,  # 兼容旧路径
+                })
+                pid = self._chunk_point_id(paper_id, meta["section_name"], meta["chunk_index"])
+                ids.append(pid)
+                points.append(PointStruct(id=pid, vector=vec, payload=meta))
+
+            # 3. upsert
+            self.client.upsert(
+                collection_name=self.l2_collection,
+                points=points,
+                wait=True,
+            )
+
+            # 4. 确保索引到位（KB 字段：kb_id/paper_id/section_name/source_db）
+            self._ensure_payload_indexes(self.l2_collection, [
+                "kb_id", "user_id", "paper_id", "section_name", "source_db", "authors",
+            ])
+
+            return ids
+
+        except Exception as e:
+            raise VectorStoreException(f"add_paper_chunks_kb 失败: {str(e)}")
+
+    async def add_paper_chunks_l1(
+        self,
+        paper_id: str,
+        chunks: List[Document],
+        paper_meta: Optional[Dict] = None,
+    ) -> List[str]:
+        """全局预置库（L1）入库。kb_id = 'l1_preset'，user_id 留空。
+
+        注意：MVP 阶段预置库采用与 L2 相同的 collection（混在 innocore_l2_user 中以 kb_id 隔离），
+        避免对生产 L1 数据做迁移。如果以后想物理隔离 L1/L2，可改用 l1_collection。
+        当前实现与 add_paper_chunks_kb 等价，仅 kb_id 取 l1_preset。
+        """
+        return await self.add_paper_chunks_kb(
+            kb_id=self.KB_L1_PRESET,
+            user_id="",
+            paper_id=paper_id,
+            chunks=chunks,
+            paper_meta=paper_meta,
+        )
+
+    async def search_kb(
+        self,
+        kb_id: str,
+        query: str,
+        top_k: int = 5,
+        paper_filter: Optional[str] = None,
+        section_filter: Optional[str] = None,
+    ) -> List[Dict]:
+        """在指定 kb 内做相似度检索（强制 kb_id must）。返回 chunk 级结果。
+
+        Returns:
+            [{
+                "id": str,
+                "paper_id": str,
+                "title": str,
+                "authors": list,
+                "section_name": str,
+                "section_type": str,
+                "chunk_index": int,
+                "content": str,
+                "score": float,
+            }, ...]
+        """
+        if not kb_id:
+            raise VectorStoreException("kb_id 不能为空")
+        if not query or not query.strip():
+            return []
+        try:
+            query_vec = await self._embed_query(query)
+
+            conditions = [
+                FieldCondition(key="kb_id", match=MatchValue(value=kb_id))
+            ]
+            if paper_filter:
+                conditions.append(FieldCondition(key="paper_id", match=MatchValue(value=paper_filter)))
+            if section_filter:
+                conditions.append(FieldCondition(key="section_name", match=MatchValue(value=section_filter)))
+
+            qfilter = Filter(must=conditions)
+
+            hits = await asyncio.to_thread(
+                self.client.query_points,
+                collection_name=self.l2_collection,
+                query=query_vec,
+                query_filter=qfilter,
+                limit=int(top_k),
+                with_payload=True,
+                with_vectors=False,
+            )
+            # 兼容新旧两层 API 形状
+            points = getattr(hits, "points", None) or (hits if isinstance(hits, list) else [])
+
+            results = []
+            for h in points:
+                payload = h.payload or {}
+                results.append({
+                    "id": str(h.id),
+                    "paper_id": payload.get("paper_id", ""),
+                    "title": payload.get("title", ""),
+                    "authors": payload.get("authors", []) or [],
+                    "venue": payload.get("venue", ""),
+                    "published_year": payload.get("published_year", 0),
+                    "section_name": payload.get("section_name", "unknown"),
+                    "section_type": payload.get("section_type", "body"),
+                    "chunk_index": int(payload.get("chunk_index", 0) or 0),
+                    "content": payload.get("content") or payload.get("page_content") or "",
+                    "score": float(h.score or 0.0),
+                })
+            return results
+
+        except Exception as e:
+            raise VectorStoreException(f"search_kb 失败: {str(e)}")
+
+    async def delete_paper_chunks(self, kb_id: str, paper_id: str) -> bool:
+        """按 (kb_id, paper_id) 物理删除一篇论文的所有 chunks。"""
+        if not kb_id or not paper_id:
+            return False
+        try:
+            filt = Filter(must=[
+                FieldCondition(key="kb_id", match=MatchValue(value=kb_id)),
+                FieldCondition(key="paper_id", match=MatchValue(value=paper_id)),
+            ])
+            await asyncio.to_thread(
+                self.client.delete,
+                collection_name=self.l2_collection,
+                points_selector=filt,
+            )
+            return True
+        except Exception as e:
+            raise VectorStoreException(f"delete_paper_chunks 失败: {str(e)}")
+
+    async def _embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """统一走 self.embeddings 的 embed_documents（同步），异步包装。"""
+        if not self.embeddings:
+            raise VectorStoreException("Embedding 未初始化，无法 embed 文本")
+        if not texts:
+            return []
+
+        def _do_embed():
+            return self.embeddings.embed_documents(texts)  # type: ignore
+
+        result = await asyncio.to_thread(_do_embed)
+        # 归一化（适配 COSINE）
+        return [_normalize(v) for v in result]
+
+    async def _embed_query(self, text: str) -> List[float]:
+        if not self.embeddings:
+            raise VectorStoreException("Embedding 未初始化")
+        def _do():
+            return self.embeddings.embed_query(text)  # type: ignore
+        v = await asyncio.to_thread(_do)
+        return _normalize(v)
+
     def is_embedding_initialized(self) -> bool:
         """检查 embedding 服务是否已初始化"""
         return self.embeddings is not None

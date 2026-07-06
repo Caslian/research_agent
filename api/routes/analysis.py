@@ -6,8 +6,10 @@ from fastapi import APIRouter, HTTPException, UploadFile, File
 from typing import Dict, Any, Optional, List
 from pydantic import BaseModel
 import logging
+import hashlib
 import os
 from core.config import get_config
+from core.database import db_manager
 from utils.pdf_parser import pdf_parser
 from agents.controller import agent_controller, TaskType
 
@@ -274,7 +276,7 @@ async def batch_analyze_papers(paper_ids: List[str], user_id: Optional[str] = No
 
 @router.post("/upload-pdf", response_model=Dict[str, Any])
 async def upload_pdf_for_analysis(file: UploadFile = File(...)):
-    """上传 PDF 文件并解析"""
+    """上传 PDF 文件并解析；解析后入库并返回 paper_id，供前端接入 KB。"""
     try:
         if not file.filename.endswith('.pdf'):
             raise HTTPException(status_code=400, detail="只支持 PDF 文件")
@@ -293,8 +295,26 @@ async def upload_pdf_for_analysis(file: UploadFile = File(...)):
 
         logger.info(f"PDF 文件已保存: {file_path}")
 
+        # 去重 + 入库：算 SHA-256，按 content_hash 唯一索引去重
+        content_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        existing = await db_manager.get_paper_by_hash(content_hash)
+        if existing and existing.get("id"):
+            paper_id = str(existing["id"])
+            logger.info(f"PDF 已存在（按 content_hash 去重）: {paper_id}")
+        else:
+            paper_id = await db_manager.create_paper(
+                title=pdf_result.get("title") or file.filename,
+                authors=pdf_result.get("authors") or [],
+                abstract=pdf_result.get("abstract") or "",
+                file_path=file_path,
+                content_hash=content_hash,
+            )
+            logger.info(f"PDF 入库成功: paper_id={paper_id}")
+
         return {
             "success": True,
+            "id": paper_id,
+            "paper_id": paper_id,
             "filename": file.filename,
             "file_path": f"/uploads/{file.filename}",
             "title": pdf_result.get("title", "未知标题"),
@@ -302,7 +322,8 @@ async def upload_pdf_for_analysis(file: UploadFile = File(...)):
             "abstract": pdf_result.get("abstract", "")[:500],
             "page_count": pdf_result.get("page_count", 0),
             "word_count": pdf_result.get("word_count", 0),
-            "message": "PDF 文件上传并解析成功，可以使用返回的 file_path 进行分析"
+            "content_hash": content_hash,
+            "message": "PDF 文件上传并解析成功，可以使用返回的 paper_id 加入知识库",
         }
     except HTTPException:
         raise

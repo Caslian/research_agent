@@ -87,6 +87,64 @@ class ResearchPaperParser:
         self.text_processor = TextProcessor()
         self.section_names = list(self.SECTION_PATTERNS.keys())
     
+    # ------------------------------------------------------------
+    # 同步/文本入口（供已拿到 full_text 的链路复用，例如 KB 入库）
+    # ------------------------------------------------------------
+    def parse(self, full_text: str, page_count: int = 0, word_count: int = 0) -> Optional[ResearchPaper]:
+        """
+        从已经提取出来的 PDF 全文构建 ResearchPaper。
+
+        与 :meth:`parse_paper` 的区别：
+        - ``parse_paper`` 接收 PDF 文件路径，内部会再次调用 PDF 解析器；
+        - 本方法只接收文本，跳过 PDF 读取步骤，方便上游已解析好文本时复用同一套
+          元数据/章节/关键词提取逻辑。
+        """
+        start_time = datetime.now()
+        try:
+            if not full_text:
+                logger.warning("parse() 收到空 full_text，返回 None")
+                return None
+
+            metadata = self._PaperMetadataFromFullText(full_text)
+
+            sections = self._extract_sections(full_text)
+            key_terms = self._extract_key_terms(full_text, sections)
+
+            end_time = datetime.now()
+            parsing_duration = (end_time - start_time).total_seconds()
+
+            return ResearchPaper(
+                metadata=metadata,
+                sections=sections,
+                full_text=full_text,
+                page_count=page_count,
+                total_word_count=word_count or len(full_text.split()),
+                key_terms=key_terms[:15],
+                parsing_method="research_paper_parser.text",
+                parsing_time=f"{parsing_duration:.2f}s",
+            )
+        except Exception as e:
+            logger.error(f"parse() 解析异常: {str(e)}", exc_info=True)
+            return None
+
+    def _PaperMetadataFromFullText(self, full_text: str) -> PaperMetadata:
+        """在仅有全文的情况下构造一个 best-effort 的元数据。"""
+        # 标题：取首行非空文本
+        title = "Unknown"
+        for line in full_text.splitlines():
+            stripped = line.strip()
+            if stripped:
+                title = stripped[:200]
+                break
+        return PaperMetadata(
+            title=title,
+            authors=["Unknown"],
+            abstract="",
+            keywords=self._extract_keywords_from_text(full_text),
+            publication_date=None,
+            venue=None,
+        )
+
     async def parse_paper(self, file_path: str, extract_keywords: bool = True) -> Optional[ResearchPaper]:
         """
         解析科研论文

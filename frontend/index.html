@@ -120,13 +120,20 @@
         .interaction-panel {
             background: #f8f9fa;
             border-radius: 10px;
-            padding: 30px;
+            padding: 24px 24px 28px 24px;
             margin-top: 30px;
+            width: 100%;
+            max-width: 100%;
+            box-sizing: border-box;
             display: none;
         }
 
         .interaction-panel.active {
             display: block;
+        }
+
+        .interaction-panel > * {
+            max-width: 100%;
         }
 
         .input-group {
@@ -491,6 +498,7 @@
             line-height: 1.8;
         }
     </style>
+    <link rel="stylesheet" href="/static/css/style.css">
 </head>
 
 <body>
@@ -594,35 +602,40 @@
                 <div class="response-area" id="hunter-response"></div>
             </div>
 
-            <!-- Miner Agent 交互面板 -->
-            <div class="interaction-panel" id="miner-panel">
-                <h3>🧠 论文分析</h3>
-                <div class="input-group">
-                    <label for="paper-upload">上传论文 (PDF)</label>
-                    <div class="file-upload" id="paper-upload-area">
-                        <p>📄 点击或拖拽PDF文件到此处</p>
-                        <input type="file" id="paper-file" accept=".pdf" style="display: none;">
+            <!-- Miner Agent 交互面板 — RAG 知识库问答 -->
+            <div class="interaction-panel kb-panel" id="miner-panel">
+                <h3>💬 知识库问答</h3>
+
+                <!-- 知识库选择行 -->
+                <div class="kb-selector-row">
+                    <label for="kb-select">知识库</label>
+                    <select id="kb-select" class="kb-select"></select>
+                    <button type="button" id="create-kb-btn" class="btn btn-mini">+ 新建</button>
+                    <span id="kb-meta" class="kb-meta"></span>
+                </div>
+
+                <!-- 对话消息区 — 固定高度主舞台 -->
+                <div class="response-area chat-response-area" id="miner-response">
+                    <div class="chat-empty" id="miner-empty">
+                        <div class="hint-title">🧠 知识库对话</div>
+                        <div>选择知识库后，从下方输入框提问，或点击 📎 上传 PDF 入库。</div>
                     </div>
                 </div>
-                <div class="input-group">
-                    <label for="paper-url">或输入论文URL</label>
-                    <input type="url" id="paper-url" placeholder="https://arxiv.org/abs/...">
-                </div>
-                <div class="input-group">
-                    <label for="analysis-type">分析类型</label>
-                    <select id="analysis-type">
-                        <option value="summary">内容摘要</option>
-                        <option value="innovation">创新点分析</option>
-                        <option value="comparison">对比分析</option>
-                        <option value="comprehensive">综合分析</option>
-                    </select>
-                </div>
-                <button class="btn" onclick="executeMinerTask()">开始分析</button>
+
                 <div class="loading" id="miner-loading">
                     <div class="spinner"></div>
-                    <p>正在分析论文...</p>
+                    <p>正在处理中...</p>
                 </div>
-                <div class="response-area" id="miner-response"></div>
+
+                <!-- 对话输入区 — 宽输入框 + 附件按钮 + 发送按钮 -->
+                <div class="chat-input-wrapper" id="chat-input-wrapper">
+                    <button type="button" id="chat-attach-btn" class="chat-action-btn" title="上传 PDF 入库当前知识库">
+                        <span>📎</span>
+                    </button>
+                    <textarea id="chat-input" placeholder="向当前知识库提问…（Enter 发送 / Shift+Enter 换行）" rows="2"></textarea>
+                    <button type="button" id="chat-send-btn" class="chat-send-btn">发送</button>
+                    <input type="file" id="paper-file" accept=".pdf" hidden>
+                </div>
             </div>
 
             <!-- Coach Agent 交互面板 -->
@@ -749,7 +762,24 @@
             checkSystemStatus();
             setupFileUpload();
             setupWorkModeSwitch();
+            // MVP: 默认 demo 用户（MVP 没有真实登录，从 KB 列表 fallback 到第一个已知用户）
+            ensureCurrentUser().then(() => initKBPanel());
         });
+
+        // MVP: 简化用户标识。生产替换为真实 /login -> JWT
+        async function ensureCurrentUser() {
+            if (window.CURRENT_USER_ID) return;
+            const email = 'demo@research.local';
+            try {
+                const r = await fetch(`/api/v1/users/by-email/${encodeURIComponent(email)}`);
+                if (r.ok) {
+                    const u = await r.json();
+                    window.CURRENT_USER_ID = u.id;
+                }
+            } catch (e) {
+                console.warn('ensureCurrentUser failed', e);
+            }
+        }
 
         // 设置工作模式切换
         function setupWorkModeSwitch() {
@@ -841,42 +871,223 @@
             }
         }
 
-        // 执行Miner任务
-        async function executeMinerTask() {
-            const paperUrl = document.getElementById('paper-url').value;
-            const analysisType = document.getElementById('analysis-type').value;
+        // ========== KB 知识库问答 ==========
 
-            if (!paperUrl.trim()) {
-                showError('miner-response', '请输入论文URL或上传PDF文件');
+        // 加载 KB 列表并填入下拉框
+        async function loadKBList(selectAfter = null) {
+            const userId = window.CURRENT_USER_ID;
+            if (!userId) return [];
+            try {
+                const res = await fetch(`/api/v1/kb/list?user_id=${encodeURIComponent(userId)}`);
+                if (!res.ok) return [];
+                const list = await res.json();
+                const sel = document.getElementById('kb-select');
+                if (!sel) return list;
+                sel.innerHTML = list.map(kb => {
+                    const tag = kb.is_default ? ' ⭐' : '';
+                    return `<option value="${kb.id}">${escapeHtml(kb.name)}${tag} · ${kb.paper_count} 篇</option>`;
+                }).join('');
+                if (selectAfter) {
+                    sel.value = selectAfter;
+                }
+                updateKBMeta(list.find(k => k.id === sel.value) || list[0]);
+                sel.addEventListener('change', () => {
+                    const cur = list.find(k => k.id === sel.value);
+                    updateKBMeta(cur);
+                });
+                return list;
+            } catch (e) {
+                showError('miner-response', `加载知识库失败: ${e.message}`);
+                return [];
+            }
+        }
+
+        function updateKBMeta(kb) {
+            const m = document.getElementById('kb-meta');
+            if (!kb) {
+                m.textContent = '';
+                return;
+            }
+            m.textContent = `已分块 ${kb.chunk_count} · 论文 ${kb.paper_count}`;
+        }
+
+        // 新建知识库 (inline)
+        async function createKnowledgeBaseInline() {
+            const userId = window.CURRENT_USER_ID;
+            if (!userId) {
+                showError('miner-response', '未登录');
+                return;
+            }
+            const name = (prompt('为新知识库起个名字:') || '').trim();
+            if (!name) return;
+            try {
+                const res = await apiPost('/api/v1/kb/create', {
+                    user_id: userId,
+                    name,
+                    description: '前端 inline 创建',
+                    embedding_model: 'text-embedding-v4'
+                });
+                await loadKBList(res.id);
+            } catch (e) {
+                showError('miner-response', `创建 KB 失败: ${e.message}`);
+            }
+        }
+
+        // 发送对话消息
+        async function sendChatMessage() {
+            const input = document.getElementById('chat-input');
+            const query = (input.value || '').trim();
+            const sel = document.getElementById('kb-select');
+            const kbId = sel ? sel.value : '';
+            const userId = window.CURRENT_USER_ID;
+
+            if (!query) return;
+            if (!kbId) {
+                showError('miner-response', '请先选择知识库');
+                return;
+            }
+            if (!userId) {
+                showError('miner-response', '未登录');
                 return;
             }
 
+            appendChatMessage('user', query);
+            input.value = '';
             showLoading('miner-loading');
 
             try {
-                const response = await fetch('/api/v1/analysis/analyze', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        paper_url: paperUrl,
-                        analysis_type: analysisType
-                    })
+                const data = await apiPost('/api/v1/chat/ask', {
+                    user_id: userId, kb_id: kbId, query, top_k: 5
                 });
-
-                const data = await response.json();
-
-                if (response.ok) {
-                    showSuccess('miner-response', '论文分析完成', data);
-                } else {
-                    showError('miner-response', data.detail || '分析失败');
-                }
-            } catch (error) {
-                showError('miner-response', `网络错误: ${error.message}`);
-            } finally {
                 hideLoading('miner-loading');
+                if (data && data.answer) {
+                    appendChatMessage('assistant', data.answer, data.sources || []);
+                } else {
+                    appendChatMessage('assistant', '未检索到结果。');
+                }
+            } catch (err) {
+                hideLoading('miner-loading');
+                showError('miner-response', `网络错误: ${err.message}`);
             }
+        }
+
+        // 渲染单条消息（user / assistant）
+        function appendChatMessage(role, content, sources = []) {
+            const c = document.getElementById('miner-response');
+            const empty = document.getElementById('miner-empty');
+            if (empty && empty.parentNode === c) c.removeChild(empty);
+            const cls = role === 'user' ? 'chat-message user' : 'chat-message assistant';
+            const avatar = role === 'user' ? '👤' : '🤖';
+            const label = role === 'user' ? '你' : '助手';
+
+            // assistant 走 renderMarkdown（已存在）；user 用 escapeHtml 防 XSS
+            const html = role === 'user' ? escapeHtml(content) : renderMarkdown(content);
+
+            let srcHtml = '';
+            if (role === 'assistant' && sources.length) {
+                srcHtml = `<div class="chat-sources">${sources.map((s, i) => `
+                    <details class="source-card">
+                        <summary>📄 ${escapeHtml(s.title || s.paper_id || '来源')} · 章节 ${escapeHtml(s.section_name || '?')} · 相关度 ${(s.score * 100).toFixed(0)}%</summary>
+                        <div class="source-content">${escapeHtml((s.content || '').slice(0, 500))}${(s.content || '').length > 500 ? '…' : ''}</div>
+                    </details>
+                `).join('')}</div>`;
+            }
+
+            c.insertAdjacentHTML('beforeend', `
+                <div class="${cls}">
+                    <div class="chat-avatar">${avatar}</div>
+                    <div class="chat-bubble">
+                        <div class="chat-role">${label}</div>
+                        <div class="chat-content markdown-content">${html}</div>
+                        ${srcHtml}
+                    </div>
+                </div>
+            `);
+            c.scrollTop = c.scrollHeight;
+        }
+
+        function appendSystemMessage(text, innerHtml) {
+            const c = document.getElementById('miner-response');
+            const empty = document.getElementById('miner-empty');
+            if (empty && empty.parentNode === c) c.removeChild(empty);
+            c.insertAdjacentHTML('beforeend', `
+                <div class="chat-message system">
+                    <div class="chat-bubble system-bubble">
+                        <div class="chat-content">${text}</div>
+                        ${innerHtml ? `<div class="chat-extra">${innerHtml}</div>` : ''}
+                    </div>
+                </div>
+            `);
+            c.scrollTop = c.scrollHeight;
+        }
+
+        // KB Panel 初始化（在 app 启动时调用一次即可）
+        async function initKBPanel() {
+            await loadKBList();
+            const sendBtn = document.getElementById('chat-send-btn');
+            if (sendBtn) sendBtn.addEventListener('click', sendChatMessage);
+            const cb = document.getElementById('create-kb-btn');
+            if (cb) cb.addEventListener('click', createKnowledgeBaseInline);
+            const ci = document.getElementById('chat-input');
+            if (ci) ci.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    sendChatMessage();
+                }
+            });
+            // 📎 附件按钮 — 触发隐藏的 file input
+            const attachBtn = document.getElementById('chat-attach-btn');
+            const fileInput = document.getElementById('paper-file');
+            if (attachBtn && fileInput) {
+                attachBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    fileInput.click();
+                });
+            }
+            // 输入框整体支持拖拽上传 PDF
+            const wrapper = document.getElementById('chat-input-wrapper');
+            if (wrapper) {
+                wrapper.addEventListener('dragover', (e) => {
+                    if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')) {
+                        e.preventDefault();
+                        wrapper.classList.add('dragover');
+                    }
+                });
+                wrapper.addEventListener('dragleave', () => wrapper.classList.remove('dragover'));
+                wrapper.addEventListener('drop', (e) => {
+                    wrapper.classList.remove('dragover');
+                    const files = e.dataTransfer && e.dataTransfer.files;
+                    if (files && files.length > 0 && files[0].type === 'application/pdf') {
+                        e.preventDefault();
+                        handleFileUpload(files[0]);
+                    }
+                });
+            }
+        }
+
+        // HTML 转义
+        function escapeHtml(str) {
+            if (str == null) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
+        // 通用 POST: JSON
+        async function apiPost(url, body) {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || `HTTP ${res.status}`);
+            }
+            return res.json();
         }
 
         // 执行Coach任务
@@ -1001,85 +1212,83 @@
             }
         }
 
-        // 设置文件上传
+        // 设置文件上传 — 上传 UI 现在是输入框旁的 📎 按钮 + 隐藏 input。
+// 拖拽到输入框的行为在 initKBPanel() 里绑定到 .chat-input-wrapper。
+// 这里只负责 file input change → handleFileUpload。
         function setupFileUpload() {
-            const uploadArea = document.getElementById('paper-upload-area');
             const fileInput = document.getElementById('paper-file');
-
-            uploadArea.addEventListener('click', () => fileInput.click());
-
-            uploadArea.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                uploadArea.classList.add('dragover');
-            });
-
-            uploadArea.addEventListener('dragleave', () => {
-                uploadArea.classList.remove('dragover');
-            });
-
-            uploadArea.addEventListener('drop', (e) => {
-                e.preventDefault();
-                uploadArea.classList.remove('dragover');
-
-                const files = e.dataTransfer.files;
-                if (files.length > 0 && files[0].type === 'application/pdf') {
-                    handleFileUpload(files[0]);
-                }
-            });
-
+            if (!fileInput) return;
             fileInput.addEventListener('change', (e) => {
                 if (e.target.files.length > 0) {
                     handleFileUpload(e.target.files[0]);
+                    e.target.value = '';
                 }
             });
         }
 
-        // 处理文件上传
+        // 处理文件上传 - KB 模式: 解析 -> 入 DB -> 分块+入库 Qdrant
         async function handleFileUpload(file) {
-            const formData = new FormData();
-            formData.append('file', file);
+            const kbId = document.getElementById('kb-select').value;
+            if (!kbId) {
+                showError('miner-response', '请先选择或新建一个知识库再上传 PDF');
+                return;
+            }
+            const userId = window.CURRENT_USER_ID;
+            if (!userId) {
+                showError('miner-response', '未登录：缺少用户标识');
+                return;
+            }
 
             showLoading('miner-loading');
-
             try {
-                // 使用新的 PDF 解析端点
-                const response = await fetch('/api/v1/analysis/upload-pdf', {
-                    method: 'POST',
-                    body: formData
+                const formData = new FormData();
+                formData.append('file', file);
+
+                // 1. 解析 PDF，获取 paper_id
+                const uploadRes = await fetch('/api/v1/analysis/upload-pdf', {
+                    method: 'POST', body: formData
+                });
+                if (!uploadRes.ok) {
+                    const err = await uploadRes.json().catch(() => ({}));
+                    throw new Error(err.detail || 'PDF 解析失败');
+                }
+                const paper = await uploadRes.json();
+                const paperId = paper.id || paper.paper_id;
+                if (!paperId) {
+                    throw new Error('上传接口未返回 paper_id');
+                }
+
+                // 2. 加入 KB（DB 关联）
+                await apiPost(`/api/v1/kb/${kbId}/papers`, {
+                    user_id: userId, paper_id: paperId
                 });
 
-                const data = await response.json();
-
-                if (response.ok) {
-                    // 自动填充 URL 字段
-                    document.getElementById('paper-url').value = data.file_path || '';
-
-                    // 显示解析结果
-                    const uploadInfo = `
-                        <div class="paper-card">
-                            <h4>📄 ${data.title || file.name}</h4>
-                            <div class="authors">
-                                👥 作者: ${data.authors ? data.authors.join(', ') : '未知'}
-                            </div>
-                            <div class="abstract">
-                                📝 ${data.abstract || '无摘要'}
-                            </div>
-                            <div class="meta">
-                                <span>📄 ${data.page_count || 0} 页</span>
-                                <span>📊 ${data.word_count || 0} 词</span>
-                                <span>✅ 已解析</span>
-                            </div>
-                        </div>
-                    `;
-
-                    showSuccess('miner-response', '✅ PDF 文件上传并解析成功！现在可以选择分析类型并开始分析。', {
-                        upload_info: uploadInfo
-                    });
-                } else {
-                    showError('miner-response', data.detail || '上传失败');
+                // 3. 分块+向量化入库
+                const proc = await fetch(`/api/v1/kb/${kbId}/papers/${paperId}/process?user_id=${encodeURIComponent(userId)}`, {
+                    method: 'POST'
+                });
+                if (!proc.ok) {
+                    const err = await proc.json().catch(() => ({}));
+                    throw new Error(err.detail || '入库失败');
                 }
-            } catch (error) {
-                showError('miner-response', `上传错误: ${error.message}`);
+                const procRes = await proc.json();
+
+                // 4. 渲染上传成功卡片
+                const card = `
+                    <div class="paper-card chat-upload-card">
+                        <h4>📄 ${escapeHtml(paper.title || file.name)}</h4>
+                        <div class="authors">👥 ${(paper.authors || []).map(escapeHtml).join(', ') || '未知'}</div>
+                        <div class="meta">
+                            <span>📄 ${paper.page_count || 0} 页</span>
+                            <span>🧩 ${procRes.chunk_count || 0} chunks</span>
+                            <span>✅ 已入库当前知识库</span>
+                        </div>
+                    </div>
+                `;
+                appendSystemMessage(`✅ 论文 "${escapeHtml(paper.title || file.name)}" 已入库，分块 ${procRes.chunk_count} 条，可开始提问。`, card);
+
+            } catch (err) {
+                showError('miner-response', `上传错误: ${err.message}`);
             } finally {
                 hideLoading('miner-loading');
             }
@@ -1113,10 +1322,6 @@
                 // 论文搜索结果
                 else if (data.papers && Array.isArray(data.papers)) {
                     content += formatPaperResults(data);
-                }
-                // 论文分析结果（analysis 可能为空字符串，用 hasOwnProperty 判断）
-                else if (data.hasOwnProperty('analysis')) {
-                    content += formatAnalysisResult(data);
                 }
                 // 写作助手结果（支持字符串或任意结构化对象：polish/explain/suggest/mimic）
                 else if (data.result && (typeof data.result === 'string' || (typeof data.result === 'object' && !Array.isArray(data.result)))) {
@@ -1172,51 +1377,6 @@
                     </div>
                 `;
             });
-
-            return html;
-        }
-
-        // 格式化论文分析结果
-        function formatAnalysisResult(data) {
-            let html = `
-                <div class="result-header">
-                    <span>🧠 论文分析</span>
-                    <span class="result-stats">${data.analysis_type}</span>
-                </div>
-            `;
-            
-            // 显示模型信息
-            if (data.model_info) {
-                const mi = data.model_info;
-                html += `<div style="background: #f0f4ff; padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; font-size: 12px;">
-                    <span style="color: #667eea; font-weight: bold;">🤖</span> 当前模型: <strong>${mi.llm_model || '未配置'}</strong>
-                    <span style="color: #999; margin-left: 10px;">(${mi.llm_provider || 'OpenAI'})</span>
-                </div>`;
-            }
-
-            if (data.paper_info) {
-                html += `
-                    <div class="paper-card">
-                        <h4>${escapeHtml(data.paper_info.title)}</h4>
-                        <div class="authors">
-                            👥 作者: ${data.paper_info.authors.join(', ')}
-                        </div>
-                        <div class="meta">
-                            <span>📅 ${data.paper_info.published_date}</span>
-                            <span>🔗 <a href="${data.paper_info.url}" target="_blank">查看原文</a></span>
-                            <span>🏷️ ${data.paper_info.categories.join(', ')}</span>
-                        </div>
-                    </div>
-                `;
-            }
-
-            const analysisId = 'analysis-' + Date.now();
-            html += '<div class="paper-card">';
-            html += '<h4>📊 分析结果 <button class="copy-btn" onclick="copyToClipboard(\'' + analysisId + '\', event)" style="float: right;">📋 复制</button></h4>';
-            html += '<div class="markdown-content" id="' + analysisId + '">';
-            html += renderMarkdown(data.analysis);
-            html += '</div>';
-            html += '</div>';
 
             return html;
         }

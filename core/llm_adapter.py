@@ -147,3 +147,7 @@ def get_llm_adapter() -> LLMAdapter:
     if _llm_adapter is None:
         _llm_adapter = LLMAdapter()
     return _llm_adapter
+
+
+# 全局延迟初始化实例 - 其他模块直接 `from core.llm_adapter import llm_adapter` 即可
+llm_adapter: LLMAdapter = get_llm_adapter()

@@ -232,6 +232,7 @@ class HunterAgent(BaseAgent):
     
     async def _filter_papers(self, papers: List[Dict], keywords: List[str]) -> List[Dict]:
         """根据关键词筛选论文"""
+        # TODO: 论文相关性匹配分数 relevance_score 由论文标题、摘要部分进行关键词比较得出，可以探索更好的计算方案
         filtered_papers = []
         
         for paper in papers:
