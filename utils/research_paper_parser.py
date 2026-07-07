@@ -445,3 +445,74 @@ class ResearchPaperParser:
             logger.warning(f"提取创新洞察时出错: {str(e)}")
         
         return insights
+
+
+# ============================================================
+# Hunter 笔记生成辅助
+# ============================================================
+
+class PaperIntroExtractor:
+    """从论文 full_text 中抽取 intro 末尾的贡献描述 + methodology 概要。
+
+    设计目标:
+    - Hunter 阶段只需要 LLM 看到"贡献陈述 + 方法概要"即可生成 200-300 字笔记
+    - 不需要整段 PDF 文本,避免 prompt 过长、token 浪费
+    - 提取失败时返回空串,上层 fallback 到只基于 abstract 的简化 prompt
+    """
+
+    # 句子分隔符（中英文）
+    _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+(?=[A-Z一-龥])")
+
+    @classmethod
+    def extract_contribution(cls, full_text: str, max_chars: int = 800) -> str:
+        """提取 introduction 末尾的 contribution/contributions 段落。
+
+        策略:
+        1. 先用 ResearchPaperParser.SECTION_PATTERNS 切出 introduction
+        2. 在 introduction 中找 "contribution" / "contributions" / "本文贡献" / "本工作贡献" 等关键词附近句子
+        3. 截取该句子及后续 1-2 句,直到 max_chars 上限
+        """
+        intro = cls._extract_intro_section(full_text)
+        if not intro:
+            return ""
+        # 关键词模式
+        contribution_patterns = [
+            r"(?:our\s+(?:main\s+)?contributions?|the\s+contributions?\s+of\s+this\s+(?:paper|work|study)|we\s+contribute|主要贡献|本文的贡献|本工作(的)?主要贡献)",
+        ]
+        for pat in contribution_patterns:
+            m = re.search(pat, intro, re.IGNORECASE)
+            if m:
+                # 从匹配位置往后取 max_chars 字符
+                snippet = intro[m.start(): m.start() + max_chars].strip()
+                # 截断到最近的句末
+                sentences = cls._SENTENCE_SPLIT_RE.split(snippet)
+                if sentences:
+                    return sentences[0][:max_chars].strip()
+                return snippet[:max_chars]
+        # 没找到关键词 → 取 introduction 末尾 600 字作为兜底
+        tail = intro[-max_chars:].strip()
+        return tail
+
+    @classmethod
+    def extract_methodology(cls, full_text: str, max_chars: int = 1200) -> str:
+        """提取 methodology 段落。
+
+        优先匹配 Section Patterns 的 method/methodology/methods/approach。
+        截取前 max_chars 字符。
+        """
+        for pat_list in ResearchPaperParser.SECTION_PATTERNS.get("method", []):
+            m = re.search(pat_list, full_text, re.IGNORECASE | re.DOTALL)
+            if m:
+                content = m.group(1).strip()
+                content = re.sub(r"\s+", " ", content)
+                return content[:max_chars]
+        return ""
+
+    @classmethod
+    def _extract_intro_section(cls, full_text: str) -> str:
+        for pat_list in ResearchPaperParser.SECTION_PATTERNS.get("introduction", []):
+            m = re.search(pat_list, full_text, re.IGNORECASE | re.DOTALL)
+            if m:
+                content = m.group(1).strip()
+                return re.sub(r"\s+", " ", content)
+        return ""

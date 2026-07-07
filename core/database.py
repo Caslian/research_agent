@@ -90,6 +90,21 @@ class DatabaseManager:
         );
 
         -- ============================================================
+        -- Hunter 笔记表：Hunter 阶段生成的论文技术路线笔记（持久化，不设 TTL）
+        -- 备注：Hunter 阶段论文尚未入库 papers 表，所以用 arxiv_id 作主键。
+        --        用户将论文入库时，通过 content_hash / doi 回填 paper_id。
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS hunter_notes (
+            arxiv_id     VARCHAR(120) PRIMARY KEY,                      -- arxiv ID（主键，Hunter 阶段即有）
+            paper_id     UUID REFERENCES papers(id) ON DELETE SET NULL, -- 论文入库后回填（可空，Hunter 阶段为空）
+            source       VARCHAR(20)  DEFAULT 'arxiv',                  -- 来源：arxiv / ieee
+            note         TEXT NOT NULL,                                 -- LLM 生成的中文技术路线笔记
+            model        VARCHAR(60)  DEFAULT '',                       -- 生成笔记所用的模型名
+            generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,           -- 笔记生成时间
+            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP            -- 更新时间（入库回填 paper_id 时更新）
+        );
+
+        -- ============================================================
         -- 用户-论文关系表：多对多 + 个性化标注
         -- ============================================================
         CREATE TABLE IF NOT EXISTS user_paper_relations (
@@ -240,6 +255,32 @@ class DatabaseManager:
         CREATE INDEX IF NOT EXISTS idx_kb_paper_relations_paper       ON kb_paper_relations(paper_id);        -- KB 论文关系按论文过滤
         CREATE INDEX IF NOT EXISTS idx_kb_chunks_log_kb_paper         ON kb_paper_chunks_log(kb_id, paper_id);-- 同步日志查找
         CREATE INDEX IF NOT EXISTS idx_kb_chunks_log_status           ON kb_paper_chunks_log(status);         -- 同步日志按状态过滤
+        CREATE INDEX IF NOT EXISTS idx_hunter_notes_paper_id          ON hunter_notes(paper_id);             -- 按 paper_id 查找（入库后回填）
+
+        -- ============================================================
+        -- 用户论文已读状态表：hunter 搜索结果去重（用户级全局）
+        --
+        -- 触发场景：
+        --   1. 用户将论文加入 KB  → reason='added_to_kb'（被动，写入时记录 kb_id/paper_id）
+        --   2. 用户主动点击"标记已读" → reason='marked_read'（主动）
+        -- 永久只插入（ON CONFLICT DO NOTHING），不做撤回。
+        -- 标识键 paper_key = "{source}:{id}"（如 'arxiv:2401.01234' / 'ieee:9876543'），
+        -- 因为 Hunter 阶段 paper 尚未入库，paper_id 不可用，需要用 source+id 自构造。
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS user_paper_read_state (
+            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id     UUID REFERENCES users(id) ON DELETE CASCADE,
+            paper_key   VARCHAR(160) NOT NULL,                         -- 'arxiv:2401.01234' / 'ieee:9876543'
+            source      VARCHAR(20)  NOT NULL,                         -- arxiv / ieee
+            reason      VARCHAR(20)  NOT NULL,                         -- 'added_to_kb' / 'marked_read'
+            kb_id       UUID REFERENCES knowledge_bases(id) ON DELETE SET NULL,  -- 来源 KB（可空）
+            paper_id    UUID REFERENCES papers(id) ON DELETE SET NULL,           -- 关联 paper（可空）
+            title       TEXT NOT NULL,                                 -- 冗余存储标题，避免 paper 清理后无据可查
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, paper_key)                                 -- 用户+论文键唯一
+        );
+        CREATE INDEX IF NOT EXISTS idx_read_state_user                 ON user_paper_read_state(user_id);
+        CREATE INDEX IF NOT EXISTS idx_read_state_user_kb              ON user_paper_read_state(user_id, kb_id);
         """
         
         async with self.pool.acquire() as conn:
@@ -357,7 +398,140 @@ class DatabaseManager:
                 f"%{query}%", limit, offset
             )
             return [dict(row) for row in rows]
-    
+
+    # ---- Hunter 笔记 ----
+
+    async def save_hunter_note(
+        self,
+        arxiv_id: str,
+        note: str,
+        source: str = "arxiv",
+        model: str = "",
+    ) -> bool:
+        """保存或更新 Hunter 阶段生成的笔记（upsert）。
+
+        注意：Hunter 阶段 paper_id 未知，所以暂不填，入库时再回填。
+        """
+        try:
+            await self.execute(
+                """
+                INSERT INTO hunter_notes (arxiv_id, source, note, model, generated_at)
+                VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+                ON CONFLICT (arxiv_id) DO UPDATE SET
+                    note = EXCLUDED.note,
+                    model = EXCLUDED.model,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                arxiv_id, source, note, model,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"save_hunter_note 失败 {arxiv_id}: {e}")
+            return False
+
+    async def get_hunter_note(self, arxiv_id: str) -> Optional[Dict]:
+        """按 arxiv_id 读取笔记。"""
+        return await self.fetchrow(
+            "SELECT * FROM hunter_notes WHERE arxiv_id = $1", arxiv_id
+        )
+
+    async def get_hunter_notes(self, limit: int = 50) -> List[Dict]:
+        """读取所有笔记（最近生成优先）。"""
+        return await self.fetch(
+            """
+            SELECT * FROM hunter_notes
+            ORDER BY generated_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+
+    async def bind_paper_to_hunter_note(self, arxiv_id: str, paper_id: str) -> bool:
+        """用户将论文入库后，回填 paper_id 到 hunter_notes。"""
+        try:
+            r = await self.execute(
+                """
+                UPDATE hunter_notes SET paper_id = $1, updated_at = CURRENT_TIMESTAMP
+                WHERE arxiv_id = $2 AND paper_id IS NULL
+                """,
+                paper_id, arxiv_id,
+            )
+            return r == "UPDATE 1"
+        except Exception as e:
+            logger.warning(f"bind_paper_to_hunter_note 失败: {e}")
+            return False
+
+    # ---- 用户论文已读状态（user-level dedup for Hunter 搜索）----
+
+    async def mark_paper_read(
+        self,
+        user_id: str,
+        paper_key: str,
+        source: str,
+        reason: str,
+        title: str,
+        kb_id: Optional[str] = None,
+        paper_id: Optional[str] = None,
+    ) -> bool:
+        """将一篇论文标记为该用户的"已读"（INSERT-only，幂等）。
+
+        Args:
+            user_id:    用户 ID（UUID 字符串）
+            paper_key:  '{source}:{id}' 形式，如 'arxiv:2401.01234' / 'ieee:9876543'
+            source:     'arxiv' / 'ieee'
+            reason:     'added_to_kb' / 'marked_read'
+            title:      论文标题（冗余存储）
+            kb_id:      若来自 KB 入库，记录 KB（可空）
+            paper_id:   若已入库，回填 paper_id（可空）
+
+        Returns:
+            True 表示执行成功（不区分是否实际新增，幂等即可）
+        """
+        try:
+            await self.execute(
+                """
+                INSERT INTO user_paper_read_state
+                    (user_id, paper_key, source, reason, kb_id, paper_id, title)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (user_id, paper_key) DO NOTHING
+                """,
+                user_id, paper_key, source, reason, kb_id, paper_id, title or "",
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"mark_paper_read 失败 user={user_id} key={paper_key}: {e}")
+            return False
+
+    async def list_read_paper_keys(self, user_id: str) -> set:
+        """返回该用户所有已读论文的 paper_key 集合。
+
+        Hunter 搜索阶段用：O(1) 查表过滤，避免对每篇 paper 单独 SQL。
+        """
+        try:
+            rows = await self.fetch(
+                "SELECT paper_key FROM user_paper_read_state WHERE user_id = $1",
+                user_id,
+            )
+            return {r["paper_key"] for r in rows}
+        except Exception as e:
+            logger.warning(f"list_read_paper_keys 失败 user={user_id}: {e}")
+            return set()
+
+    async def list_read_papers_for_user(
+        self, user_id: str, limit: int = 200
+    ) -> List[Dict]:
+        """前端展示该用户的已读论文清单（按时间倒序）。"""
+        return await self.fetch(
+            """
+            SELECT paper_key, source, reason, title, kb_id, paper_id, created_at
+            FROM user_paper_read_state
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            user_id, limit,
+        )
+
     # 用户论文关系操作
     async def add_paper_to_user(self, user_id: str, paper_id: str, 
                                tags: List[str] = None, rating: int = 0) -> bool:
@@ -536,13 +710,54 @@ class DatabaseManager:
     # ---- 数据库状态查询 ----
     async def get_table_counts(self) -> Dict[str, int]:
         tables = ["papers", "users", "user_paper_relations", "analysis_reports",
-                   "agent_execution_logs", "agent_tool_calls", "workflow_executions"]
+                  "agent_execution_logs", "agent_tool_calls", "workflow_executions"]
         counts = {}
         async with self.get_connection() as conn:
             for table in tables:
                 row = await conn.fetchrow(f"SELECT COUNT(*) as cnt FROM {table}")
                 counts[table] = row["cnt"] if row else 0
         return counts
+
+    # ---- KB 去重查询（Hunter 阶段使用）----
+
+    async def list_paper_titles_and_dois_in_kb(self, kb_id: str) -> List[Dict[str, Any]]:
+        """列出 KB 内所有论文的 (id, title, doi, content_hash)。
+
+        用于 Hunter 阶段: 拿到 arxiv 论文后,用 title/doi 在这里做命中检查。
+        注: arxiv 论文 Hunter 阶段还没有 content_hash,所以只能在 DOI 上做精确匹配。
+        """
+        async with self.get_connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT p.id, p.title, p.doi, p.content_hash
+                FROM papers p
+                JOIN kb_paper_relations r ON r.paper_id = p.id
+                WHERE r.kb_id = $1
+                """,
+                kb_id,
+            )
+            return [dict(r) for r in rows]
+
+    async def get_paper_by_doi(self, doi: str) -> Optional[Dict[str, Any]]:
+        """按 DOI 查论文（精确匹配）。"""
+        if not doi:
+            return None
+        async with self.get_connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM papers WHERE doi = $1 LIMIT 1", doi,
+            )
+            return dict(row) if row else None
+
+    async def get_paper_by_title_fuzzy(self, title: str) -> Optional[Dict[str, Any]]:
+        """按标题近似匹配（ILIKE 包含）。"""
+        if not title:
+            return None
+        async with self.get_connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM papers WHERE title ILIKE $1 LIMIT 1",
+                f"%{title.strip()[:120]}%",
+            )
+            return dict(row) if row else None
 
     async def close(self):
         """关闭数据库连接池"""

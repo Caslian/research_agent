@@ -252,6 +252,106 @@
             text-decoration: underline;
         }
 
+        /* ====== Hunter v2: AI 笔记 + 下载按钮 + 徽章 ====== */
+
+        .paper-card .ai-note {
+            background: linear-gradient(135deg, #f8f9ff 0%, #f3e7ff 100%);
+            border-left: 3px solid #667eea;
+            border-radius: 6px;
+            padding: 12px 14px;
+            margin: 12px 0;
+            font-size: 0.92rem;
+        }
+
+        .paper-card .ai-note-label {
+            color: #667eea;
+            font-weight: 600;
+            margin-bottom: 6px;
+            font-size: 0.85rem;
+        }
+
+        .paper-card .ai-note-body {
+            color: #2d3748;
+            line-height: 1.7;
+        }
+
+        .paper-card .ai-note-body p {
+            margin: 6px 0;
+        }
+
+        .paper-card .note-loading {
+            color: #999;
+            font-size: 0.85rem;
+            padding: 6px 0;
+        }
+
+        .paper-card .paper-actions {
+            margin-top: 12px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .paper-card .paper-actions .btn {
+            padding: 6px 14px;
+            font-size: 0.88rem;
+        }
+        /* 「标记已读」次级动作按钮：浅色边框 + 文字按钮，与主按钮「下载到知识库」
+           形成视觉层级，不抢眼但一眼能找到。 */
+        .btn-mark-read {
+            background: white;
+            color: #4a5568;
+            border: 1px solid #cbd5e0;
+            border-radius: 6px;
+            padding: 6px 14px;
+            font-size: 0.88rem;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .btn-mark-read:hover:not(:disabled) {
+            background: #edf2f7;
+            border-color: #a0aec0;
+        }
+        .btn-mark-read:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        /* 「已读过 / 已入 KB」灰色态：用户处理过的论文，按钮保持可见但明显置灰，
+           让用户在同一搜索结果页里能一眼看出"这篇已审批"，
+           与未审批的「⬇ 下载到知识库」「✓ 标记已读」形成清晰的视觉对比。 */
+        .btn-resolved {
+            background: #edf2f7;
+            color: #718096;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            padding: 6px 14px;
+            font-size: 0.88rem;
+            cursor: not-allowed;
+            font-weight: 500;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            margin-left: 4px;
+        }
+        .badge-cache {
+            background: #e6f7ec;
+            color: #2f855a;
+        }
+        .badge-done {
+            background: #e0e7ff;
+            color: #4c51bf;
+        }
+        .badge-read {
+            background: #fff5e6;
+            color: #b7791f;
+        }
+
         .result-header {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
@@ -594,6 +694,14 @@
                     <label for="search-limit">论文数量限制</label>
                     <input type="number" id="search-limit" value="10" min="1" max="50">
                 </div>
+
+                <!-- 目标知识库选择（Hunter 入库目标） -->
+                <div class="kb-selector-row">
+                    <label for="hunter-kb-select">目标知识库</label>
+                    <select id="hunter-kb-select" class="kb-select"></select>
+                    <span id="hunter-kb-meta" class="kb-meta"></span>
+                </div>
+
                 <button class="btn" onclick="executeHunterTask()">开始搜索</button>
                 <div class="loading" id="hunter-loading">
                     <div class="spinner"></div>
@@ -829,6 +937,46 @@
             currentAgent = agentType;
             document.getElementById(`${agentType}-card`).classList.add('active');
             document.getElementById(`${agentType}-panel`).classList.add('active');
+
+            // Hunter 面板：复用 Miner 的 KB 列表，保证 hunter-kb-select 与 miner-kb-select 同步
+            if (agentType === 'hunter') {
+                _refreshHunterKBSelect();
+            }
+        }
+
+        // 同步 hunter-kb-select：复用同一个 KB 列表，并显示 chunk/paper 数
+        async function _refreshHunterKBSelect() {
+            const sel = document.getElementById('hunter-kb-select');
+            if (!sel) return;
+            const userId = window.CURRENT_USER_ID;
+            if (!userId) {
+                sel.innerHTML = '<option value="">未登录</option>';
+                return;
+            }
+            try {
+                const res = await fetch(`/api/v1/kb/list?user_id=${encodeURIComponent(userId)}`);
+                if (!res.ok) {
+                    sel.innerHTML = '<option value="">加载失败</option>';
+                    return;
+                }
+                const list = await res.json();
+                sel.innerHTML = list.map(kb => {
+                    const tag = kb.is_default ? ' ⭐' : '';
+                    return `<option value="${kb.id}">${escapeHtml(kb.name)}${tag} · ${kb.paper_count} 篇</option>`;
+                }).join('');
+                // 默认选 Miner 当前选中项；没有则取第一项
+                const minerSel = document.getElementById('kb-select');
+                if (minerSel && minerSel.value) {
+                    sel.value = minerSel.value;
+                }
+                const meta = document.getElementById('hunter-kb-meta');
+                const cur = list.find(k => k.id === sel.value) || list[0];
+                if (meta && cur) {
+                    meta.textContent = `已分块 ${cur.chunk_count} · 论文 ${cur.paper_count}`;
+                }
+            } catch (e) {
+                sel.innerHTML = '<option value="">加载失败</option>';
+            }
         }
 
         // 执行Hunter任务
@@ -839,6 +987,16 @@
 
             if (!keywords.trim()) {
                 showError('hunter-response', '请输入搜索关键词');
+                return;
+            }
+
+            // KB 选择（可空；空时不进行 KB 去重过滤，但下载时需选择）
+            const kbSel = document.getElementById('hunter-kb-select');
+            const kbId = kbSel ? kbSel.value : '';
+            const userId = window.CURRENT_USER_ID;
+
+            if (!kbId) {
+                showError('hunter-response', '请先在 Miner 面板选择/新建一个知识库');
                 return;
             }
 
@@ -853,13 +1011,16 @@
                     body: JSON.stringify({
                         keywords: keywords,
                         source: source,
-                        limit: parseInt(limit)
+                        limit: parseInt(limit),
+                        kb_id: kbId,
+                        user_id: userId,
                     })
                 });
 
                 const data = await response.json();
 
                 if (response.ok) {
+                    window._lastHunterPapers = data.papers || [];
                     showSuccess('hunter-response', `找到 ${data.papers?.length || 0} 篇相关论文`, data);
                 } else {
                     showError('hunter-response', data.detail || '搜索失败');
@@ -1340,7 +1501,7 @@
             responseDiv.innerHTML = content;
         }
 
-        // 格式化论文搜索结果
+        // 格式化论文搜索结果（v2：显示 LLM 笔记 + 下载按钮）
         function formatPaperResults(data) {
             let html = `
                 <div class="result-header">
@@ -1348,7 +1509,7 @@
                     <span class="result-stats">共找到 ${data.papers.length} 篇论文</span>
                 </div>
             `;
-            
+
             // 显示模型信息
             if (data.model_info) {
                 const mi = data.model_info;
@@ -1359,26 +1520,203 @@
             }
 
             data.papers.forEach((paper, index) => {
+                const safeId = escapeHtml(paper.id || '');
+                const noteHtml = paper.note_status === 'ready' && paper.note
+                    ? `<div class="ai-note-body markdown-content">${renderMarkdown(paper.note)}</div>`
+                    : (paper.note_status === 'failed'
+                        ? `<div class="note-loading" style="color:#c00;">⚠️ 笔记生成失败</div>`
+                        : `<div class="note-loading">⏳ 笔记生成中...</div>`);
+                const inKbBadge = paper.in_kb
+                    ? `<span class="badge badge-done">已在 KB 中</span>`
+                    : '';
+                const cachedBadge = paper.pdf_cached
+                    ? `<span class="badge badge-cache">PDF 已缓存</span>`
+                    : '';
+                const readBadge = paper.mark_read
+                    ? `<span class="badge badge-read">已读过</span>`
+                    : '';
+                const btnHtml = paper.in_kb
+                    ? `<button class="btn btn-secondary" disabled>已在知识库</button>`
+                    : `<button class="btn btn-primary"
+                          id="btn-dl-${safeId}"
+                          onclick="downloadToKB('${safeId}', '${escapeHtml(paper.pdf_url || '')}', ${index})">
+                          ⬇ 下载到知识库
+                       </button>`;
+                // 「标记已读」按钮始终可见，与 KB 状态正交：
+                //   已在 KB → reason='added_to_kb' 自动写入已读集合，所以按钮 disabled
+                //   未读   → 可点击，触发 POST /api/v1/papers/mark-read
+                const markBtnHtml = paper.mark_read
+                    ? `<button class="btn btn-secondary" disabled>✅ 已读过</button>`
+                    : `<button class="btn btn-mark-read"
+                          id="btn-mark-${safeId}"
+                          onclick="markAsRead('${safeId}', '${escapeHtml(paper.source || 'arxiv')}', ${index}, this)">
+                          ✓ 标记已读
+                       </button>`;
+
                 html += `
-                    <div class="paper-card">
+                    <div class="paper-card" data-paper-id="${safeId}" data-paper-source="${escapeHtml(paper.source || 'arxiv')}">
                         <h4>${index + 1}. ${escapeHtml(paper.title)}</h4>
                         <div class="authors">
-                            👥 作者: ${paper.authors.join(', ')}
-                        </div>
-                        <div class="abstract">
-                            📝 ${escapeHtml(paper.abstract)}
+                            👥 ${(paper.authors || []).map(a => escapeHtml(a)).join(', ')}
                         </div>
                         <div class="meta">
-                            <span>📅 ${paper.published_date}</span>
-                            <span>🔗 <a href="${paper.url}" target="_blank">查看原文</a></span>
-                            ${paper.pdf_url ? `<span>📄 <a href="${paper.pdf_url}" target="_blank">下载PDF</a></span>` : ''}
-                            <span>🆔 ${paper.id}</span>
+                            <span>📅 ${escapeHtml(paper.published_date || '')}</span>
+                            <span>📊 相关性 ${paper.relevance_score || 0}</span>
+                            ${paper.url ? `<span>🔗 <a href="${paper.url}" target="_blank">查看原文</a></span>` : ''}
+                            ${cachedBadge}
+                            ${inKbBadge}
+                            ${readBadge}
                         </div>
+                        <div class="ai-note">
+                            <div class="ai-note-label">🤖 LLM 技术路线笔记</div>
+                            ${noteHtml}
+                        </div>
+                        <div class="paper-actions">${btnHtml}${markBtnHtml}</div>
                     </div>
                 `;
             });
 
             return html;
+        }
+
+        // 把 Hunter 搜索到的论文下载到当前知识库
+        async function downloadToKB(arxivId, pdfUrl, paperIndex) {
+            const userId = window.CURRENT_USER_ID;
+            const kbSel = document.getElementById('hunter-kb-select');
+            const kbId = kbSel ? kbSel.value : '';
+            if (!userId || !kbId) {
+                showError('hunter-response', '请先选择知识库并确保已登录');
+                return;
+            }
+
+            // 从最后一次搜索结果缓存中取 paper 元数据（用于请求体 note/title/abstract）
+            const lastPapers = (window._lastHunterPapers || []);
+            const paper = lastPapers[paperIndex] || {};
+
+            showLoading('hunter-loading');
+            try {
+                const res = await fetch(
+                    `/api/v1/papers/${encodeURIComponent(arxivId)}/download-to-kb`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            user_id: userId,
+                            kb_id: kbId,
+                            pdf_url: pdfUrl,
+                            arxiv_id: arxivId,
+                            note: paper.note || '',
+                            title: paper.title || '',
+                            abstract: paper.abstract || '',
+                        }),
+                    }
+                );
+                const data = await res.json();
+                if (!res.ok) {
+                    throw new Error(data.detail || '入库失败');
+                }
+
+                // 更新按钮状态 + KB 计数。
+                // 关键：保持原结果页 10 张卡片全部不动，只把这一行的两个按钮置灰。
+                // - dlBtn：置灰「✅ 已加入知识库」
+                // - markBtn：同步置灰「✅ 已读过」（后端入库时已自动写入已读集合 reason='added_to_kb'）
+                // - 不调用 showSuccess，避免在结果区弹 toast 干扰用户继续审批其他卡片
+                const dlBtn = document.getElementById(`btn-dl-${arxivId}`);
+                if (dlBtn) {
+                    dlBtn.className = 'btn-resolved';
+                    dlBtn.disabled = true;
+                    dlBtn.textContent = '✅ 已加入知识库';
+                }
+                const markBtn = document.getElementById(`btn-mark-${arxivId}`);
+                if (markBtn) {
+                    markBtn.className = 'btn-resolved';
+                    markBtn.disabled = true;
+                    markBtn.textContent = '✅ 已读过';
+                }
+                // KB 列表（左侧）的计数需要刷新，因为有新论文加入当前 KB。
+                // 这是辅助面板，不影响搜索结果区。
+                if (typeof loadKBList === 'function') {
+                    await loadKBList(kbId);
+                }
+            } catch (err) {
+                showError('hunter-response', `入库失败: ${err.message}`);
+            } finally {
+                hideLoading('hunter-loading');
+            }
+        }
+
+        // 把 Hunter 搜索到的论文标记为"已读"（用户主动点击）
+        // 与 downloadToKB 的区别：
+        //   - 不下载 PDF、不入库
+        //   - 后端写一条 user_paper_read_state(reason='marked_read')
+        //   - 下次搜索会自动跳过（即使不传 kb_id 也会过滤，因为是 user-level dedup）
+        // - arxiv 与 IEEE 论文的 key namespace 不同（paper_key = "{source}:{id}"），
+        //   前端把 source 透传给后端，避免冲突。
+        // - 不需要选 KB，因此即使没选 KB 也能用。
+        async function markAsRead(paperId, source, paperIndex, btnEl) {
+            const userId = window.CURRENT_USER_ID;
+            if (!userId) {
+                showError('hunter-response', '请先登录后再标记');
+                return;
+            }
+
+            // 从最后一次搜索结果缓存中取 paper 元数据（用于请求体 title）
+            const lastPapers = (window._lastHunterPapers || []);
+            const paper = lastPapers[paperIndex] || {};
+
+            // 防重复点击：按下立即把按钮置为已读态
+            if (btnEl) {
+                btnEl.disabled = true;
+                btnEl.textContent = '⏳ 标记中...';
+            }
+
+            try {
+                // 按 source 选 arxiv_id / ieee_id 字段，与后端 Pydantic 模型一致
+                const body = {
+                    user_id: userId,
+                    source,
+                    title: paper.title || '',
+                };
+                if (source === 'ieee') {
+                    body.ieee_id = paperId;
+                } else {
+                    body.arxiv_id = paperId;
+                }
+
+                const res = await fetch(
+                    '/api/v1/papers/mark-read',
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    }
+                );
+                const data = await res.json();
+                if (!res.ok) {
+                    throw new Error(data.detail || data.message || '标记失败');
+                }
+
+                // 把按钮永久置为「已读过」（置灰），保持原结果页不动。
+                // 用户希望：在 10 篇卡片里逐个决策，每条处理完只是变灰；
+                // 直到用户主动重新搜索，结果页才被替换。
+                // 因此这里：
+                //   1. 不调用 showSuccess（避免在结果区域弹 toast，干扰其他卡片浏览）
+                //   2. 用 .btn-resolved 类统一置灰样式
+                //   3. 不重渲染 .paper-actions，避免其他按钮抖动
+                const markBtn = btnEl || document.getElementById(`btn-mark-${paperId}`);
+                if (markBtn) {
+                    markBtn.className = 'btn-resolved';
+                    markBtn.disabled = true;
+                    markBtn.textContent = '✅ 已读过';
+                }
+            } catch (err) {
+                // 失败时：在按钮自身上显示一个短暂错误态，不污染结果区（用户还在浏览其他卡片）。
+                if (btnEl) {
+                    btnEl.className = 'btn-mark-read';
+                    btnEl.disabled = false;
+                    btnEl.textContent = `❌ ${err.message}（重试）`;
+                }
+            }
         }
 
         // 改进的 Markdown 渲染器

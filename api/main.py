@@ -93,20 +93,41 @@ async def lifespan(app: FastAPI):
     try:
         await agent_controller.initialize()
         logger.info("智能体控制器初始化完成")
-        
+
         # 启动任务处理器
         import asyncio
         asyncio.create_task(agent_controller.start_task_processor())
         logger.info("任务处理器已启动")
     except Exception as e:
         logger.warning(f"智能体控制器初始化失败: {str(e)}")
-    
+
+    # 初始化 HunterCache 并启动周期清理（可选，失败不阻断启动）
+    cache_cleanup_task = None
+    try:
+        from core.hunter_cache import hunter_cache, cache_cleanup_loop
+        # 启动时清理一次过期缓存
+        cleaned = await hunter_cache.cleanup_expired()
+        logger.info(f"Hunter cache 启动清理：删除 {cleaned} 个过期条目")
+        # 启动后台周期任务
+        cache_cleanup_task = asyncio.create_task(
+            cache_cleanup_loop(hunter_cache, interval_seconds=86400)
+        )
+        logger.info("Hunter cache 周期清理任务已启动（24h）")
+    except Exception as e:
+        logger.warning(f"Hunter cache 初始化失败（将以无缓存模式运行）: {str(e)}")
+
     logger.info("InnoCore AI 启动完成")
-    
+
     yield
-    
+
     # 关闭时清理
     logger.info("正在关闭InnoCore AI...")
+    if cache_cleanup_task is not None:
+        cache_cleanup_task.cancel()
+        try:
+            await cache_cleanup_task
+        except asyncio.CancelledError:
+            pass
     await agent_controller.shutdown()
     await db_manager.close()
     await vector_store_manager.close()

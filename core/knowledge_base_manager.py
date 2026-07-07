@@ -411,6 +411,92 @@ class KnowledgeBaseManager:
                 pass
             raise
 
+    # ---------- 笔记作为 chunk 入 Qdrant ----------
+
+    async def add_note_as_chunk(
+        self,
+        kb_id: str,
+        paper_id: str,
+        user_id: str,
+        note_text: str,
+        paper_title: str,
+        paper_meta: Optional[Dict] = None,
+    ) -> str:
+        """把 LLM 笔记作为 1 个特殊 chunk 写入 KB 的 Qdrant collection。
+
+        chunk metadata:
+          - paper_id
+          - section_name = "hunter_note"      # 特殊 section 标识
+          - section_type = "ai_summary"
+          - chunk_index = -1                  # 排序时排在最前
+          - is_hunter_note = True
+
+        Returns:
+            Qdrant point id
+        """
+        if not note_text or not note_text.strip():
+            raise InnoCoreException("note_text 不能为空")
+
+        await self.get_kb(kb_id, user_id)
+        paper_meta = paper_meta or {}
+
+        note_doc = Document(
+            page_content=note_text.strip(),
+            metadata={
+                "paper_id": paper_id,
+                "paper_title": paper_title,
+                "section_name": "hunter_note",
+                "section_type": "ai_summary",
+                "chunk_index": -1,
+                "is_hunter_note": True,
+                "chunk_token_count": len(note_text),
+            },
+        )
+
+        ids = await vector_store_manager.add_paper_chunks_kb(
+            kb_id=kb_id,
+            user_id=user_id,
+            paper_id=paper_id,
+            chunks=[note_doc],
+            paper_meta={
+                "title": paper_title,
+                "authors": paper_meta.get("authors", []) or [],
+                "venue": paper_meta.get("venue", ""),
+                "published_year": paper_meta.get("published_year", 0),
+            },
+        )
+
+        # chunk 计数 +1
+        await db_manager.execute(
+            """
+            UPDATE kb_paper_chunks_log
+            SET chunk_count = chunk_count + 1
+            WHERE kb_id = $1 AND paper_id = $2 AND status = 'ready'
+              AND id = (SELECT id FROM kb_paper_chunks_log
+                        WHERE kb_id = $1 AND paper_id = $2
+                        ORDER BY created_at DESC LIMIT 1)
+            """,
+            kb_id, paper_id,
+        )
+        await db_manager.execute(
+            """
+            UPDATE kb_paper_relations SET chunk_count = chunk_count + 1
+            WHERE kb_id = $1 AND paper_id = $2
+            """,
+            kb_id, paper_id,
+        )
+        await db_manager.execute(
+            """
+            UPDATE knowledge_bases
+            SET chunk_count = chunk_count + 1, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            """,
+            kb_id,
+        )
+
+        logger.info(f"笔记 chunk 注入成功: paper_id={paper_id}, kb_id={kb_id}, point_id={ids[0] if ids else 'n/a'}")
+        return ids[0] if ids else ""
+
     # ---------- RAG 问答 ----------
 
     async def ask_knowledge_base(

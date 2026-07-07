@@ -35,7 +35,7 @@ class LLMConfig:
     base_url: Optional[str] = None
     temperature: float = 0.7
     max_tokens: int = 4000
-    timeout: int = 60
+    timeout: int = 90
 
 @dataclass
 class VectorDBConfig:
